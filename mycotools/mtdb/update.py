@@ -30,6 +30,7 @@ from Bio import Entrez
 from datetime import datetime
 from collections import defaultdict
 from mycotools.lib import mtdb_sql
+from mycotools.lib.jgitoken import resolve_jgi_token
 from mycotools.lib.dbtools import (
     clean_jgi_token,
     db2df,
@@ -1801,14 +1802,25 @@ def gather_login(mycocosm, jgi_token=None):
     jgi_token = clean_jgi_token(jgi_token)
     want_jgi = bool(mycocosm or jgi_token)
 
-    ncbi_api, stored_token = login_check(jgi=want_jgi and not jgi_token)
+    # the JGI token is never prompted for here: it expires in 12 h, so the
+    # resolver below takes it from the clipboard / environment and only asks
+    # when neither holds one
+    ncbi_api, stored_token = login_check(jgi=False)
     if ncbi_api:
         Entrez.api_key = ncbi_api
 
     if not want_jgi:
         return ncbi_api, None
 
-    return ncbi_api, jgi_token or stored_token
+    jgi_token = resolve_jgi_token(explicit=jgi_token, stored=stored_token)
+    if not jgi_token:
+        logger.error(
+            "MycoCosm needs a JGI session token and none was found. Copy one from "
+            "the Data Portal (avatar menu, 'Copy My Session Token') and rerun, or "
+            "pass --jgi_token"
+        )
+        sys.exit(100)
+    return ncbi_api, jgi_token
 
 
 def set_kingdom_options(config, jgi_token): 

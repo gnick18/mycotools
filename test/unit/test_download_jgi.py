@@ -322,6 +322,9 @@ class _Resp:
     def __init__(self, status):
         self.status_code = status
 
+    def close(self):
+        pass
+
 
 def _patch_get(monkeypatch, behaviour):
     """Replace requests.Session.get; `behaviour(url)` returns a status code."""
@@ -371,3 +374,179 @@ def test_login_accepts_bearer_prefixed_token(monkeypatch):
     session, token = jgi.jgi_api_login("Bearer " + "a" * 40, max_attempts=1, spacer="")
     assert token == "a" * 40
     assert session.headers["Authorization"] == "Bearer " + "a" * 40
+
+
+# --------------------------------------------------------------------------- #
+# token expiry mid-run: renew and retry, else defer - never fail genomes
+# --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def no_ambient_token(monkeypatch):
+    """The login and renewal paths look for a token on the clipboard, in the
+    environment and at a prompt; none of that may leak in from the machine the
+    tests run on."""
+    import sys
+    from mycotools.download import jgi
+    from mycotools.lib import jgitoken
+
+    monkeypatch.setattr(jgitoken, "read_clipboard", lambda timeout=3: None)
+    monkeypatch.delenv(jgitoken.ENV_TOKEN, raising=False)
+    monkeypatch.delenv(jgitoken.ENV_TOKEN_FILE, raising=False)
+
+    class _NoTty:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdin", _NoTty())
+    monkeypatch.setattr(jgi, "_LAST_GOOD_TOKEN", [None])
+
+
+def _jwt(left):
+    import base64, json, time
+
+    def enc(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    claims = {"iss": "https://auth.jgi.doe.gov/auth/realms/jgi-web", "exp": time.time() + left}
+    return f"{enc({'alg': 'RS256'})}.{enc(claims)}.sig"
+
+
+class _PostSession:
+    """A session whose POSTs answer with a scripted list of status codes and
+    remember the Authorization header each one carried."""
+
+    def __init__(self, statuses, token="old-token"):
+        self.headers = {"Authorization": "Bearer " + token}
+        self.jgi_token = token
+        self.statuses = list(statuses)
+        self.sent_auth = []
+
+    def post(self, url, **kwargs):
+        self.sent_auth.append(self.headers.get("Authorization"))
+        return _Resp(self.statuses.pop(0))
+
+
+def _fresh_token_available(monkeypatch, token):
+    from mycotools.download import jgi
+
+    monkeypatch.setattr(jgi, "resolve_jgi_token", lambda **kw: token)
+    monkeypatch.setattr(jgi, "_token_rejected", lambda t: False)
+
+
+def test_401_renews_the_token_and_retries_once(monkeypatch):
+    from mycotools.download import jgi
+
+    _fresh_token_available(monkeypatch, "new-token")
+    session = _PostSession([401, 200])
+    resp = jgi._authed_post(session, "https://example/restore", spacer="")
+    assert resp.status_code == 200
+    assert session.sent_auth == ["Bearer old-token", "Bearer new-token"]
+    assert session.jgi_token == "new-token"
+
+
+def test_401_with_no_fresh_token_raises_instead_of_failing_quietly(monkeypatch):
+    from mycotools.download import jgi
+
+    monkeypatch.setattr(jgi, "resolve_jgi_token", lambda **kw: None)
+    session = _PostSession([401])
+    with pytest.raises(jgi.JGITokenExpired):
+        jgi._authed_post(session, "https://example/restore", spacer="")
+
+
+def test_other_failures_are_not_mistaken_for_expiry(monkeypatch):
+    from mycotools.download import jgi
+
+    monkeypatch.setattr(jgi, "resolve_jgi_token", lambda **kw: pytest.fail("asked"))
+    session = _PostSession([403])
+    assert jgi._authed_post(session, "https://example/restore", spacer="").status_code == 403
+    assert len(session.sent_auth) == 1
+
+
+def test_a_token_known_to_have_expired_is_renewed_before_the_request(monkeypatch):
+    """Read from the token's own exp: no failed request is needed to find out."""
+    from mycotools.download import jgi
+
+    _fresh_token_available(monkeypatch, "new-token")
+    session = _PostSession([200], token=_jwt(left=-60))
+    jgi._authed_post(session, "https://example/download", spacer="")
+    assert session.sent_auth == ["Bearer new-token"]
+
+
+def test_a_token_that_is_still_good_is_left_alone(monkeypatch):
+    from mycotools.download import jgi
+
+    monkeypatch.setattr(jgi, "resolve_jgi_token", lambda **kw: pytest.fail("asked"))
+    good = _jwt(left=7200)
+    session = _PostSession([200], token=good)
+    jgi._authed_post(session, "https://example/download", spacer="")
+    assert session.sent_auth == ["Bearer " + good]
+
+
+def test_a_renewal_jgi_rejects_is_not_installed(monkeypatch):
+    from mycotools.download import jgi
+
+    offered = iter(["rejected-1", "rejected-2", None])
+    monkeypatch.setattr(jgi, "resolve_jgi_token", lambda **kw: next(offered))
+    monkeypatch.setattr(jgi, "_token_rejected", lambda t: True)
+    session = _PostSession([])
+    assert jgi.renew_token(session, spacer="") is False
+    assert session.jgi_token == "old-token"
+
+
+class _FakeSession:
+    headers = {"Authorization": "Bearer t"}
+    jgi_token = "t"
+
+
+def _gff(portal):
+    return _f(f"{portal}_FilteredModels1_2025-06-08.gff3.gz", "genes_filtered", fmt="gff3")
+
+
+def _run_main(monkeypatch, tmp_path, portals, dwnld_org):
+    import pandas as pd
+    from mycotools.download import jgi
+
+    monkeypatch.setattr(jgi, "jgi_api_login", lambda token, spacer="": (_FakeSession(), token))
+    monkeypatch.setattr(
+        jgi,
+        "search_organism",
+        lambda session, portal, spacer="": (
+            {"id": "id-" + portal, "name": portal + " v1.0", "mycocosm_portal_id": portal},
+            [dict(_gff(portal), _id="f-" + portal)],
+        ),
+    )
+    monkeypatch.setattr(jgi, "_dwnld_org", dwnld_org)
+    df = pd.DataFrame({"portal": portals})
+    deferred = set()
+    out, failed = jgi.main(
+        df, tmp_path, "tok", assembly=False, gff3=True, spacer="",
+        request_delay=0, deferred=deferred,
+    )
+    return out, failed, deferred
+
+
+def test_expiry_mid_run_defers_the_unfinished_genomes_not_fails_them(monkeypatch, tmp_path):
+    """Three genomes; the token dies while the second downloads. The first is
+    kept, the other two are returned as deferred (retried next run), not as
+    failures that would be blacklisted."""
+    from mycotools.download import jgi
+
+    def dwnld_org(session, token, ids, portal, selected, output, tmp_dir, spacer):
+        if portal == "B":
+            raise jgi.JGITokenExpired("The JGI session token expired")
+        return {"gff3": f"{output}/gff3/{portal}.gff3.gz"}
+
+    out, failed, deferred = _run_main(monkeypatch, tmp_path, ["A", "B", "C"], dwnld_org)
+    assert deferred == {"B", "C"}
+    assert failed == {"B", "C"}  # callers split these on `deferred`
+    done = out.set_index("portal")["gff3_path"]
+    assert done["A"].endswith("A.gff3.gz")
+    assert "A" not in failed
+
+
+def test_a_run_whose_token_holds_has_nothing_deferred(monkeypatch, tmp_path):
+    def dwnld_org(session, token, ids, portal, selected, output, tmp_dir, spacer):
+        return {"gff3": f"{output}/gff3/{portal}.gff3.gz"}
+
+    out, failed, deferred = _run_main(monkeypatch, tmp_path, ["A", "B"], dwnld_org)
+    assert deferred == set() and failed == set()
+    assert out["gff3_path"].notna().all()

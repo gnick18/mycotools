@@ -37,6 +37,7 @@ import pandas as pd
 from tqdm import tqdm
 from mycotools.lib.kontools import format_path, outro, intro, setup_logging
 from mycotools.lib.dbtools import clean_jgi_token, login_check
+from mycotools.lib.jgitoken import resolve_jgi_token, is_usable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -269,6 +270,94 @@ def _fill_if_empty(df, i, col, value):
         df.at[i, col] = value
 
 
+class JGITokenExpired(Exception):
+    """The JGI session token ran out and no fresh one could be obtained."""
+
+
+# the last token JGI accepted this process, so a run that renewed its token
+# once is not asked again by the next call that was still handed the old one
+_LAST_GOOD_TOKEN = [None]
+
+
+def _set_session_token(session, token):
+    """Make `token` the session's credential for every later request."""
+    session.headers.update({"Authorization": "Bearer " + token})
+    session.jgi_token = token
+    _LAST_GOOD_TOKEN[0] = token
+
+
+def _auth_headers(session, token):
+    """The Authorization header for one request - empty when the session already
+    carries it (as one from `jgi_api_login` does), so a renewed token takes effect."""
+    if "Authorization" in session.headers:
+        return {}
+    return {"Authorization": "Bearer " + token}
+
+
+def _token_rejected(token):
+    """True if JGI answers 401/403 to `token`. Network trouble is not a
+    rejection: it must not discard a good token."""
+    try:
+        resp = requests.get(
+            AUTH_CHECK_URL,
+            headers={"accept": "application/json", "Authorization": "Bearer " + token},
+            timeout=60,
+        )
+    except requests.RequestException:
+        return False
+    return resp.status_code in {401, 403}
+
+
+def renew_token(session, spacer="\t", reason=None):
+    """Replace the session's expired or rejected token with a fresh one, found
+    the way a first token is (see `mycotools.lib.jgitoken`): environment,
+    clipboard, then a prompt on a terminal. Returns True once the session holds
+    a token JGI accepts, False if none could be had."""
+    reason = reason or "The JGI session token has expired."
+    rejected = getattr(session, "jgi_token", None)
+    for _ in range(3):
+        fresh = resolve_jgi_token(exclude=rejected, reason=reason)
+        if not fresh:
+            return False
+        if _token_rejected(fresh):
+            logger.warning(f"{spacer}JGI rejected that token")
+            rejected = fresh
+            continue
+        _set_session_token(session, fresh)
+        logger.info(f"{spacer}JGI session token renewed")
+        return True
+    return False
+
+
+def _ensure_token(session, spacer="\t"):
+    """Renew the token before a request if it is known (from its own expiry) to
+    have run out - no network call, and no failed request to find out."""
+    token = getattr(session, "jgi_token", None)
+    if token and not is_usable(token):
+        if not renew_token(session, spacer):
+            raise JGITokenExpired(
+                "The JGI session token expired and no fresh one was available"
+            )
+
+
+def _authed_post(session, url, spacer="\t", **kwargs):
+    """POST to an endpoint that requires the session token. A 401 means the
+    token ran out mid-run: renew it and retry once rather than fail the genome.
+    Raises JGITokenExpired when no fresh token can be had."""
+    _ensure_token(session, spacer)
+    resp = session.post(url, **kwargs)
+    if resp.status_code == 401:
+        resp.close()
+        if not renew_token(
+            session, spacer, "JGI rejected the session token (it has expired)."
+        ):
+            raise JGITokenExpired(
+                "JGI rejected the session token and no fresh one was available"
+            )
+        resp = session.post(url, **kwargs)
+    return resp
+
+
 def jgi_api_login(token, max_attempts=5, spacer="\t"):
     """Return (session, token) for a JGI Data Portal session token.
 
@@ -278,17 +367,20 @@ def jgi_api_login(token, max_attempts=5, spacer="\t"):
     restore and download endpoints, then validated against an endpoint that
     requires authorization (``AUTH_CHECK_URL``; the search endpoint accepts any
     token) so an expired token fails here rather than as a run-long string of
-    per-genome misses. Exits (100) on a rejected token."""
-    token = clean_jgi_token(token)
+    per-genome misses. A missing, expired or rejected token is replaced by one
+    from the environment, the clipboard or a prompt (`resolve_jgi_token`); exits
+    (100) only when none can be had."""
+    token = resolve_jgi_token(explicit=token, stored=_LAST_GOOD_TOKEN[0])
     if not token:
         logger.error(
-            f"{spacer}No JGI session token. Supply one via --token or store it "
-            "via `mtdb manage --store`"
+            f"{spacer}No usable JGI session token. Copy one from the Data Portal "
+            "(avatar menu, 'Copy My Session Token') and rerun, or supply it via "
+            "--token, JGI_SESSION_TOKEN or JGI_SESSION_TOKEN_FILE"
         )
         sys.exit(100)
 
     session = requests.Session()
-    session.headers.update({"Authorization": "Bearer " + token})
+    _set_session_token(session, token)
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -304,7 +396,16 @@ def jgi_api_login(token, max_attempts=5, spacer="\t"):
             time.sleep(5)
             continue
         if resp.status_code in {401, 403}:
-            # an expired or malformed token is not retryable; say so and stop
+            # this token will never work; look for another, else stop
+            fresh = resolve_jgi_token(
+                exclude=token,
+                stored=_LAST_GOOD_TOKEN[0],
+                reason=f"JGI rejected the session token (status {resp.status_code}).",
+            )
+            if fresh:
+                token = fresh
+                _set_session_token(session, token)
+                continue
             logger.error(
                 f"{spacer}JGI rejected the session token (status "
                 f"{resp.status_code}); acquire a current one from an "
@@ -388,13 +489,15 @@ def request_restore(session, token, ids_payload, spacer="\t"):
     restore request's status URL, or None on failure."""
     body = {"ids": ids_payload, "send_mail": False, "api_version": "2"}
     try:
-        resp = session.post(
+        resp = _authed_post(
+            session,
             RESTORE_URL,
+            spacer,
             json=body,
             headers={
                 "accept": "application/json",
                 "content-type": "application/json",
-                "Authorization": "Bearer " + token,
+                **_auth_headers(session, token),
             },
             timeout=120,
         )
@@ -495,13 +598,15 @@ def download_zip(session, token, ids_payload, dest_zip, spacer="\t", max_attempt
     body = {"ids": ids_payload, "api_version": "2"}
     for attempt in range(1, max_attempts + 1):
         try:
-            resp = session.post(
+            resp = _authed_post(
+                session,
                 DOWNLOAD_URL,
+                spacer,
                 json=body,
                 headers={
                     "accept": "application/json",
                     "content-type": "application/json",
-                    "Authorization": "Bearer " + token,
+                    **_auth_headers(session, token),
                 },
                 timeout=1800,
                 stream=True,
@@ -810,7 +915,89 @@ def main(
     waits for as long as JGI takes. Pass a set as `deferred` to receive the
     portal ids given up on: unlike genuine failures (portal absent from
     MycoCosm, no such file type, corrupt download) they are pending JGI tape
-    I/O, so callers should retry them rather than blacklist them."""
+    I/O, so callers should retry them rather than blacklist them.
+
+    A token that runs out mid-run (they last 12 h; a tape restore can take a
+    night) is renewed from the environment, the clipboard or a prompt. If no
+    fresh one can be had the unfinished genomes are returned in `deferred`, not
+    as failures, and everything already retrieved is kept: copy a new token and
+    rerun to resume."""
+    if deferred is None:
+        deferred = set()
+    ome_set, state = set(), {}
+    try:
+        return _run(
+            df,
+            output,
+            token,
+            assembly=assembly,
+            proteome=proteome,
+            gff3=gff3,
+            transcript=transcript,
+            est=est,
+            masked=masked,
+            spacer=spacer,
+            restore_wait=restore_wait,
+            poll_interval=poll_interval,
+            request_delay=request_delay,
+            ome_col=ome_col,
+            deferred=deferred,
+            defer_tape=defer_tape,
+            restore_chunk=restore_chunk,
+            ome_set=ome_set,
+            state=state,
+        )
+    except JGITokenExpired as error:
+        return _defer_unfinished(df, state, ome_set, deferred, error, spacer)
+
+
+def _defer_unfinished(df, state, ome_set, deferred, error, spacer="\t"):
+    """The token ran out with no replacement: leave every genome that has not
+    yet been retrieved pending rather than failed, so the next run retries it.
+    A genome counts as retrieved once any of its requested file types has a path."""
+    logger.error(
+        f"{spacer}{error}. Genomes already retrieved are kept and the rest are left "
+        "pending; copy a fresh token from the JGI Data Portal and rerun to resume"
+    )
+    ome_col = state.get("ome_col")
+    if ome_col is None:
+        return df, ome_set
+    cols = [t + "_path" for t in state.get("dwnlds", []) if t + "_path" in df.columns]
+    left = 0
+    for _, row in df.iterrows():
+        portal_id = row[ome_col]
+        if portal_id in ome_set or any(pd.notna(row[c]) and row[c] for c in cols):
+            continue
+        ome_set.add(portal_id)
+        deferred.add(portal_id)
+        left += 1
+    logger.warning(f"{spacer}{left} genome(s) left pending, not failed")
+    return df, ome_set
+
+
+def _run(
+    df,
+    output,
+    token,
+    assembly=True,
+    proteome=False,
+    gff3=True,
+    transcript=False,
+    est=False,
+    masked=True,
+    spacer="\t",
+    restore_wait=None,
+    poll_interval=60,
+    request_delay=3,
+    ome_col=None,
+    deferred=None,
+    defer_tape=False,
+    restore_chunk=50,
+    ome_set=None,
+    state=None,
+):
+    """Body of `main`; see there. `ome_set` and `state` are supplied by
+    `main` so a token expiry can report what was left unfinished."""
     if deferred is None:
         deferred = set()
     if ome_col is not None:
@@ -837,6 +1024,8 @@ def main(
     if est:
         dwnlds.append("est")
 
+    if state is not None:
+        state.update(ome_col=ome_col, dwnlds=dwnlds)
     output = str(output).rstrip("/")
     for typ in dwnlds:
         Path(os.path.join(output, typ)).mkdir(parents=True, exist_ok=True)
@@ -849,7 +1038,7 @@ def main(
     logger.info(
         f"{spacer}Downloading {len(df)} JGI organism(s) via the JGI Data Portal API"
     )
-    ome_set = set()
+    ome_set = set() if ome_set is None else ome_set
     pending, restore_buffer = {}, []
     for i, row in tqdm(df.iterrows(), total=len(df)):
         portal_id = row[ome_col]
@@ -1095,10 +1284,16 @@ def cli():
     ):
         logger.error("You must choose at least one download option.")
 
-    if args.token:
-        jgi_token = clean_jgi_token(args.token)
-    else:
-        ncbi_api, jgi_token = login_check(ncbi=False)
+    # copy the token from the Data Portal, run this, done: it is found on the
+    # clipboard (or in JGI_SESSION_TOKEN[_FILE]) without any flag
+    stored_token = None if args.token else login_check(ncbi=False, jgi=False)[1]
+    jgi_token = resolve_jgi_token(explicit=args.token, stored=stored_token)
+    if not jgi_token:
+        logger.error(
+            "No usable JGI session token. Copy one from the Data Portal (avatar "
+            "menu, 'Copy My Session Token') and rerun, or pass --token"
+        )
+        sys.exit(100)
 
     args_dict = {
         "JGI Table": args.input,
