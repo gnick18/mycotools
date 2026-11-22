@@ -313,3 +313,61 @@ def test_restored_outranks_the_preferred_gff3_family():
     ]
     chosen = select_file(files, "gff3")
     assert chosen["file_name"] == "Xxx1_FilteredModels1.gff3.gz"
+
+
+# --------------------------------------------------------------------------- #
+# jgi_api_login - the token check must hit an endpoint that can say "no"
+# --------------------------------------------------------------------------- #
+class _Resp:
+    def __init__(self, status):
+        self.status_code = status
+
+
+def _patch_get(monkeypatch, behaviour):
+    """Replace requests.Session.get; `behaviour(url)` returns a status code."""
+    import requests
+
+    calls = []
+
+    def fake_get(self, url, **kwargs):
+        calls.append(url)
+        return _Resp(behaviour(url))
+
+    monkeypatch.setattr(requests.Session, "get", fake_get)
+    return calls
+
+
+def test_login_validates_against_authenticated_endpoint(monkeypatch):
+    """The search endpoint answers 200 for any token (checked live), so a token
+    check against it can never fail. The check must use AUTH_CHECK_URL."""
+    from mycotools.download import jgi
+
+    calls = _patch_get(monkeypatch, lambda url: 200)
+    jgi.jgi_api_login("a" * 40, max_attempts=1, spacer="")
+    assert calls == [jgi.AUTH_CHECK_URL]
+    assert jgi.AUTH_CHECK_URL != jgi.SEARCH_URL
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_login_rejects_token_the_server_rejects(monkeypatch, status):
+    from mycotools.download import jgi
+
+    # a faithful stand-in for the live API: only the authenticated endpoint
+    # distinguishes a bad token, the search endpoint says 200 to everyone
+    _patch_get(
+        monkeypatch,
+        lambda url: status if url == jgi.AUTH_CHECK_URL else 200,
+    )
+    with pytest.raises(SystemExit) as exc:
+        jgi.jgi_api_login("a" * 40, max_attempts=1, spacer="")
+    assert exc.value.code == 100
+
+
+def test_login_accepts_bearer_prefixed_token(monkeypatch):
+    """JGI's 'Copy My Session Token' puts the 'Bearer ' prefix on the copied text."""
+    from mycotools.download import jgi
+
+    _patch_get(monkeypatch, lambda url: 200)
+    session, token = jgi.jgi_api_login("Bearer " + "a" * 40, max_attempts=1, spacer="")
+    assert token == "a" * 40
+    assert session.headers["Authorization"] == "Bearer " + "a" * 40

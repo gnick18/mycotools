@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 SEARCH_URL = "https://files.jgi.doe.gov/mycocosm_file_list/"
 RESTORE_URL = "https://files.jgi.doe.gov/request_archived_files/"
 DOWNLOAD_URL = "https://files-download.jgi.doe.gov/download_files/"
+# The search endpoint answers 200 whatever the Authorization header holds, so it
+# cannot validate a token. /projects/ ("the current user's projects") requires a
+# valid token and returns 401 otherwise (documented in the Data Portal API).
+AUTH_CHECK_URL = "https://files.jgi.doe.gov/projects/"
 
 
 # ===========================================================================
@@ -271,8 +275,9 @@ def jgi_api_login(token, max_attempts=5, spacer="\t"):
     `token` is the bearer token copied from an authenticated JGI session, with
     or without its ``Bearer `` prefix. It is set as the session's default
     Authorization header so the search endpoint is authorized alongside the
-    restore and download endpoints, then validated against the search endpoint
-    so an expired token fails here rather than as a run-long string of
+    restore and download endpoints, then validated against an endpoint that
+    requires authorization (``AUTH_CHECK_URL``; the search endpoint accepts any
+    token) so an expired token fails here rather than as a run-long string of
     per-genome misses. Exits (100) on a rejected token."""
     token = clean_jgi_token(token)
     if not token:
@@ -288,8 +293,7 @@ def jgi_api_login(token, max_attempts=5, spacer="\t"):
     for attempt in range(1, max_attempts + 1):
         try:
             resp = session.get(
-                SEARCH_URL,
-                params={"organism": "Acain1", "api_version": "2", "x": "1"},
+                AUTH_CHECK_URL,
                 headers={"accept": "application/json"},
                 timeout=120,
             )
