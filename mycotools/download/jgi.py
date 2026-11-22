@@ -169,6 +169,29 @@ def _gff_family_rank(name):
     return None
 
 
+def _faa_name_rank(name):
+    """Rank a proteome filename, or None when it is not a primary proteome.
+
+    MycoCosm has used two naming eras for the filtered proteome, both labelled
+    ``proteins_filtered``:
+      Aspni7_GeneCatalog_proteins_20131226.aa.fasta.gz        (older, `.aa.fasta`)
+      Lst7536_1_FilteredModels1_proteins_2023-09-10.fasta.gz  (current, no `.aa.`)
+    ``proteins_filtered`` also tags the ``.tab`` annotation and promoter files
+    and, for genomes carrying an externally supplied annotation, a second
+    proteome (``Kazpsy_CBS12689_1_ExternalModels_proteins_*.fasta.gz``). The
+    current naming is therefore accepted only when it carries an approved
+    gene-model family (``_GFF_FAMILIES``), the same test the GFF3 passes, so the
+    proteome comes from the model set the chosen GFF3 describes and
+    ExternalModels is never substituted for it. The older rule is unchanged and
+    keeps precedence."""
+    if re.search(r"\.aa\.fa(sta)?(\.gz)?$", name, re.IGNORECASE):
+        return 0
+    if re.search(r"[_.\-]proteins[_.\-].*\.fa(sta)?(\.gz)?$", name, re.IGNORECASE):
+        rank = _gff_family_rank(name)
+        return None if rank is None else 1 + rank
+    return None
+
+
 def select_file(files, ftype, masked=True):
     """Choose the single best file record for `ftype` from an organism's file
     list.
@@ -200,11 +223,10 @@ def select_file(files, ftype, masked=True):
         if ftype == "gff3":
             name_rank = _gff_family_rank
         elif ftype == "faa":
-            # proteins_filtered also tags the .tab annotation and promoter files;
-            # keep only the actual proteome fasta
-            name_rank = lambda n: (
-                0 if re.search(r"\.aa\.fa(sta)?(\.gz)?$", n, re.IGNORECASE) else None
-            )
+            # proteins_filtered also tags the .tab annotation and promoter files
+            # and any ExternalModels proteome; keep only the primary proteome
+            # fasta, in either of MycoCosm's naming eras
+            name_rank = _faa_name_rank
         else:
             name_rank = lambda n: 0
     else:

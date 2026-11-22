@@ -16,6 +16,7 @@ than an obvious failure. Every record below is copied from a live JGI listing.
 import pytest
 
 from mycotools.download.jgi import (
+    _faa_name_rank,
     _gff_family_rank,
     _is_alt_allele,
     _is_mito,
@@ -550,3 +551,92 @@ def test_a_run_whose_token_holds_has_nothing_deferred(monkeypatch, tmp_path):
     out, failed, deferred = _run_main(monkeypatch, tmp_path, ["A", "B"], dwnld_org)
     assert deferred == set() and failed == set()
     assert out["gff3_path"].notna().all()
+
+
+# faa - both MycoCosm proteome naming eras (records copied from live listings)
+# --------------------------------------------------------------------------- #
+def _kazpsy_files():
+    """Kazpsy_CBS12689_1 (2025): the primary proteome is FilteredModels1 and has
+    no `.aa.` in its name; a tape-only ExternalModels proteome, a tar of it, and
+    its .info.txt carry the same `proteins_filtered` label."""
+    return [
+        _f("Kazpsy_CBS12689_1_ExternalModels_proteins_2025-06-08.fasta.gz",
+           "proteins_filtered", status="PURGED"),
+        _f("Kazpsy_CBS12689_1_ExternalModels_proteins_2025-06-08.fasta.tar.gz",
+           "proteins_filtered", fmt="tar", status="PURGED"),
+        _f("Kazpsy_CBS12689_1_FilteredModels1_proteins_2025-06-08.fasta.gz",
+           "proteins_filtered"),
+        _f("Kazpsy_CBS12689_1_FilteredModels1_proteins_2025-06-08.fasta.info.txt",
+           "mycocosm_additional_files", fmt="txt", status="PURGED"),
+        _f("Kazpsy_CBS12689_1_FilteredModels1_2025-06-08.gff3.gz",
+           "genes_filtered", fmt="gff3"),
+    ]
+
+
+def test_current_naming_proteome_is_selected():
+    """Regression: the `.aa.fasta` rule alone found no proteome for 15 of 32
+    randomly sampled public portals, every one a 2023+ release."""
+    chosen = select_file(_kazpsy_files(), "faa")
+    assert chosen["file_name"] == (
+        "Kazpsy_CBS12689_1_FilteredModels1_proteins_2025-06-08.fasta.gz"
+    )
+
+
+def test_older_naming_proteome_is_unchanged():
+    files = [
+        _f("Aspni7_GeneCatalog_proteins_20131226.aa.fasta.gz", "proteins_filtered"),
+        _f("Aspni7_GeneCatalog_proteins_20131226.aa.fasta.gz.tab",
+           "proteins_filtered", fmt="tab"),
+    ]
+    chosen = select_file(files, "faa")
+    assert chosen["file_name"] == "Aspni7_GeneCatalog_proteins_20131226.aa.fasta.gz"
+
+
+def test_external_models_proteome_never_substitutes_for_primary():
+    """An ExternalModels proteome is not the gene set the GFF3 describes."""
+    only_external = [
+        f for f in _kazpsy_files() if "FilteredModels1" not in f["file_name"]
+    ]
+    assert select_file(only_external, "faa") is None
+
+
+def test_primary_proteome_on_tape_beats_external_on_disk():
+    """File status only ranks among approved candidates; it must not admit an
+    ExternalModels file that happens to be on disk."""
+    files = _kazpsy_files()
+    for f in files:
+        if "ExternalModels_proteins_2025-06-08.fasta.gz" == f["file_name"].split(
+            "Kazpsy_CBS12689_1_", 1
+        )[1]:
+            f["file_status"] = "RESTORED"
+        if "FilteredModels1_proteins_2025-06-08.fasta.gz" in f["file_name"]:
+            f["file_status"] = "PURGED"
+    chosen = select_file(files, "faa")
+    assert "FilteredModels1" in chosen["file_name"]
+
+
+def test_all_proteins_never_fills_the_faa_slot():
+    """Lipjap1 lists `all_proteins` (label proteins_all) beside the filtered set."""
+    files = [
+        _f("Lipjap1_all_proteins_2023-09-07.fasta.gz", "proteins_all", status="PURGED"),
+        _f("Lipjap1_FilteredModels1_proteins_2023-09-07.fasta.gz", "proteins_filtered"),
+    ]
+    assert select_file(files, "faa")["file_name"].startswith(
+        "Lipjap1_FilteredModels1_proteins"
+    )
+    assert select_file(files[:1], "faa") is None
+
+
+@pytest.mark.parametrize(
+    "name, expected_none",
+    [
+        ("Aspni7_GeneCatalog_proteins_20131226.aa.fasta.gz", False),
+        ("Lst7536_1_FilteredModels1_proteins_2023-09-10.fasta.gz", False),
+        ("Kazpsy_CBS12689_1_ExternalModels_proteins_2025-06-08.fasta.gz", True),
+        ("Kazpsy_CBS12689_1_FilteredModels1_proteins_2025-06-08.fasta.info.txt", True),
+        ("Lipjap1_FilteredModels1_promoter_regions_1k.fa.gz", True),
+        ("Lipjap1_FilteredModels1_transcripts_2023-09-07.fasta.gz", True),
+    ],
+)
+def test_faa_name_rank(name, expected_none):
+    assert (_faa_name_rank(name) is None) is expected_none
