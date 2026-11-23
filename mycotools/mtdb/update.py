@@ -435,21 +435,153 @@ def dwnld_mycocosm(
     sys.exit(24)
 
 
-def dwnld_ncbi_metadata(
-    ncbi_file,
-    ncbi_url="https://ftp.ncbi.nlm.nih.gov/genomes/GENOME_REPORTS/",
-    group="eukaryotes",
-):
-    """Download the NCBI genome data spreadsheet for prokaryotes or
-    eukaryotes, and return a Pandas dataframe"""
+# NCBI stopped regenerating GENOME_REPORTS/{eukaryotes,prokaryotes}.txt on
+# 2024-10-10, and the newest genome in it was released 2024-08-30. An update
+# that enumerated it could never see a genome released afterwards, and said
+# nothing about it. The Datasets REST API is what NCBI keeps current, so the
+# genomes of a kingdom are listed from it instead. It is queried directly
+# rather than through `datasets summary genome taxon`, because that command in
+# the client versions in circulation returned 984 of the 6,055 annotated
+# GenBank fungal assemblies the API lists (datasets v14.15.0, 2026-11-22).
+NCBI_DATASETS_REPORT_URL = (
+    "https://api.ncbi.nlm.nih.gov/datasets/v2/genome/taxon/{taxon}/dataset_report"
+)
+# kingdom -> (NCBI taxon id, the "Group" label `clean_ncbi_df` selects on)
+NCBI_KINGDOM_TAXA = {
+    "fungi": (4751, "Fungi"),
+    "plants": (33090, "Plants"),
+    "viridiplantae": (33090, "Plants"),
+    "animals": (33208, "Animals"),
+    "metazoa": (33208, "Animals"),
+    "bacteria": (2, "Bacteria"),
+    "prokaryotes": (2, "Bacteria"),
+    "archaea": (2157, "Archaea"),
+}
+# the columns of the old GENOME_REPORTS table that the rest of the update reads
+NCBI_REPORT_COLUMNS = [
+    "#Organism/Name",
+    "TaxID",
+    "BioProject Accession",
+    "Group",
+    "Assembly Accession",
+    "Genes",
+    "Proteins",
+    "Release Date",
+    "Modify Date",
+    "BioSample Accession",
+    "Status",
+]
+NCBI_REPORT_EXIT = 25
 
-    ncbi_url = ncbi_url + group + ".txt"
+
+def ncbi_report_row(report, group):
+    """One Datasets genome report as a row of the old GENOME_REPORTS table.
+
+    Dates are written YYYY/MM/DD, as GENOME_REPORTS wrote them and as the
+    database stores publication dates. The report carries no modification date
+    of its own, so "Modify Date" is the later of the assembly's and its
+    annotation's release. It only dates the data a new database row is stamped
+    with: whether an assembly already in the database is an update is decided
+    by its accession version (`ncbi2db.redundancy_check`), not by this date."""
+    assembly = report.get("assembly_info", {})
+    annotation = report.get("annotation_info", {})
+    counts = annotation.get("stats", {}).get("gene_counts", {})
+    released = assembly.get("release_date", "")
+    modified = max(released, annotation.get("release_date", ""))
+    return {
+        "#Organism/Name": report.get("organism", {}).get("organism_name", ""),
+        "TaxID": report.get("organism", {}).get("tax_id", ""),
+        "BioProject Accession": assembly.get("bioproject_accession", ""),
+        "Group": group,
+        "Assembly Accession": report["accession"],
+        "Genes": counts.get("total", "-"),
+        "Proteins": counts.get("protein_coding", "-"),
+        "Release Date": released.replace("-", "/"),
+        "Modify Date": modified.replace("-", "/"),
+        "BioSample Accession": assembly.get("biosample", {}).get("accession", ""),
+        "Status": assembly.get("assembly_level", ""),
+    }
+
+
+def fetch_ncbi_reports(taxon, api=None, page_size=1000, max_attempts=4, timeout=120):
+    """Every annotated, current GenBank assembly report of `taxon` from the
+    Datasets REST API, paged. Raises RuntimeError rather than return a partial
+    list: a short list reads as 'nothing new', which is the failure this
+    replaced."""
+    url = NCBI_DATASETS_REPORT_URL.format(taxon=taxon)
+    params = {
+        "filters.assembly_source": "genbank",
+        "filters.has_annotation": "true",
+        "filters.assembly_version": "current",
+        "page_size": page_size,
+    }
+    headers = {"api-key": api} if api else {}
+    reports, expected, page_token = [], None, None
+    while True:
+        if page_token:
+            params["page_token"] = page_token
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = requests.get(
+                    url, params=params, headers=headers, timeout=timeout
+                )
+                # 429 and 5xx are the API being busy; anything else in the 4xx
+                # range is the request being wrong, which a retry cannot fix
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    raise requests.RequestException(f"HTTP {resp.status_code}")
+                if resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"NCBI Datasets refused the request for taxon {taxon}: "
+                        + f"HTTP {resp.status_code}"
+                    )
+                page = resp.json()
+                break
+            except (requests.RequestException, ValueError) as error:
+                if attempt == max_attempts:
+                    raise RuntimeError(
+                        f"NCBI Datasets did not answer for taxon {taxon}: {error}"
+                    )
+                logger.debug(f"NCBI report page attempt {attempt} failed: {error}")
+                time.sleep(2 * 2 ** (attempt - 1))
+        expected = page.get("total_count", expected)
+        reports.extend(page.get("reports", []))
+        page_token = page.get("next_page_token")
+        if not page_token:
+            break
+    if expected is not None and len(reports) != expected:
+        raise RuntimeError(
+            f"NCBI Datasets listed {expected} assemblies for taxon {taxon} but "
+            + f"{len(reports)} were received"
+        )
+    return reports
+
+
+def dwnld_ncbi_metadata(ncbi_file, kingdom="fungi", api=None, group=None):
+    """List the annotated GenBank assemblies of `kingdom` as a dataframe in the
+    layout of the old GENOME_REPORTS table, and keep it at `ncbi_file`.
+
+    The file is written only once the whole list is in hand, and its presence
+    marks the download done, so a rerun on the same date reuses it. `group`
+    (the old GENOME_REPORTS file name) is accepted and ignored."""
     if not Path(ncbi_file).is_file():
-        subprocess.call(["curl", ncbi_url, "-o", ncbi_file + ".tmp"])
+        if kingdom.lower() not in NCBI_KINGDOM_TAXA:
+            raise KeyError(f"no NCBI taxon known for kingdom {kingdom}")
+        taxon, label = NCBI_KINGDOM_TAXA[kingdom.lower()]
+        try:
+            reports = fetch_ncbi_reports(taxon, api=api)
+        except RuntimeError as error:
+            logger.error(error)
+            sys.exit(NCBI_REPORT_EXIT)
+        if not reports:
+            logger.error(f"NCBI Datasets lists no annotated {kingdom} assemblies")
+            sys.exit(NCBI_REPORT_EXIT)
+        ncbi_df = pd.DataFrame(
+            [ncbi_report_row(report, label) for report in reports],
+            columns=NCBI_REPORT_COLUMNS,
+        )
+        ncbi_df.to_csv(ncbi_file + ".tmp", sep="\t", index=False)
         shutil.move(ncbi_file + ".tmp", ncbi_file)
-    ncbi_df = pd.read_csv(ncbi_file, sep="\t")
-
-    return ncbi_df
+    return pd.read_csv(ncbi_file, sep="\t", dtype=str, keep_default_na=False)
 
 
 def dwnld_data_reports(
@@ -1280,7 +1412,9 @@ def rogue_update(
     else:
         api = 3
     ncbi_db_path = update_path + date + ".ncbi.mtdb"
-    ncbi_df_init = dwnld_ncbi_metadata(update_path + date + ".ncbi.tsv", group=group)
+    ncbi_df_init = dwnld_ncbi_metadata(
+        update_path + date + ".ncbi.tsv", kingdom=kingdom, api=ncbi_api
+    )
     logger.info("Acquiring NCBI metadata")
     ncbi_df, acc2meta = clean_ncbi_df(
         ncbi_df_init,
