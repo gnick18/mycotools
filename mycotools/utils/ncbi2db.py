@@ -17,6 +17,13 @@ from mycotools.download.ncbi import main as ncbi_dwnld
 logger = logging.getLogger(__name__)
 
 
+def accession_version(accession):
+    """The version of an assembly accession (GCA_000001405.29 -> 29); 0 when it
+    carries none, as the non-NCBI accessions in a database do not."""
+    found = re.search(r"\.(\d+)$", str(accession))
+    return int(found[1]) if found else 0
+
+
 def redundancy_check(db, ncbi_df, ass_acc, duplicates={}):
     """should expect that ncbi_df (pd.DataFrame()) is only comprised of biosamples that are
     not overlapping with JGI"""
@@ -65,32 +72,31 @@ def redundancy_check(db, ncbi_df, ass_acc, duplicates={}):
             db_organism = "_".join(
                 [db_row["genus"], db_row["species"], str(db_row["strain"])]
             )
-            if isinstance(row["version"], datetime):
-                version = row["version"]
+            # An assembly is an update only when NCBI holds a newer VERSION of
+            # it (GCA_x.1 -> GCA_x.2). It used to be decided by comparing the
+            # report's "Modify Date" with the date the database stored, but the
+            # Datasets reports the genomes are now listed from carry no
+            # modification date, and the release dates they do carry are not
+            # comparable with the stored ones: a record is commonly last
+            # modified before it is released. Compared by date, 711 of the
+            # 4,254 genomes of the 2025-04-30 database that NCBI still lists
+            # came out as updated, where the previous pipeline re-versioned 1
+            # of 6,790 over the preceding three months.
+            if accession_version(assembly_acc) > accession_version(
+                db_row["assembly_acc"]
+            ):
+                updates.append(
+                    [
+                        db_row["assembly_acc"],
+                        db_organism,
+                        organism,
+                        assembly_acc,
+                        db_ome,
+                    ]
+                )
+                todel_db.append(db_ome)
+                old_rows[assembly_acc] = db_row
             else:
-                try:
-                    version = datetime.strptime(row["version"], "%Y%m%d")
-                except ValueError:
-                    raise ValueError(row["version"], assembly_acc)
-            try:  # check if the version is new (by datetime)
-                if version > datetime.strptime(
-                    db_row["version"].replace(" 00:00:00", "").replace("-", ""),
-                    "%Y%m%d",
-                ):
-                    updates.append(
-                        [
-                            db_row["assembly_acc"],
-                            db_organism,
-                            organism,
-                            assembly_acc,
-                            db_ome,
-                        ]
-                    )
-                    todel_db.append(db_ome)
-                    old_rows[assembly_acc] = db_row
-                else:
-                    todel_ncbi.append(i)
-            except ValueError:
                 todel_ncbi.append(i)
         else:  # new entry
             updates.append([None, None, organism, assembly_acc, None])
