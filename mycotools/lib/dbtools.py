@@ -641,9 +641,16 @@ def get_login(ncbi, jgi):
     ncbi_api, jgi_token = None, None
     print(flush=True)
     if ncbi:
-        ncbi_api = clean_api_key(
-            getpass.getpass(prompt="NCBI api key (blank if none): ")
-        )
+        # the key only raises NCBI's rate limit, so it is optional: it is taken
+        # from NCBI_API_KEY (which `datasets` reads as well) and asked for only
+        # when there is a terminal to ask on. Prompting regardless raised
+        # EOFError in any job without one (CHTC, cron), whose answer would
+        # have been blank anyway.
+        ncbi_api = clean_api_key(os.environ.get("NCBI_API_KEY"))
+        if not ncbi_api and sys.stdin.isatty():
+            ncbi_api = clean_api_key(
+                getpass.getpass(prompt="NCBI api key (blank if none): ")
+            )
     if jgi:
         jgi_token = clean_jgi_token(
             getpass.getpass(prompt="JGI session token (required): ")
