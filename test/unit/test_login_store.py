@@ -176,3 +176,39 @@ def test_encrypt_pw_removes_plain_store(monkeypatch, paths):
     dbtools.encrypt_pw("K", TOKEN, info_path=paths["enc"])
     assert os.path.exists(paths["enc"])  # encrypted key written
     assert not os.path.exists(paths["plain"])  # plaintext store removed
+
+
+# --------------------------------------------------------------------------- #
+# get_login: the NCBI key is optional, so it must never block a job with no terminal
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def prompts(monkeypatch):
+    """Record every getpass prompt and answer it blank."""
+    asked = []
+    monkeypatch.setattr(dbtools.getpass, "getpass", lambda prompt="": asked.append(prompt) or "")
+    monkeypatch.delenv("NCBI_API_KEY", raising=False)
+    return asked
+
+
+def test_ncbi_key_comes_from_the_environment_without_a_prompt(prompts, monkeypatch):
+    monkeypatch.setenv("NCBI_API_KEY", "envkey123")
+    monkeypatch.setattr(dbtools.sys.stdin, "isatty", lambda: True, raising=False)
+    assert dbtools.get_login(True, False) == ("envkey123", None)
+    assert prompts == []
+
+
+def test_no_terminal_means_no_prompt_and_no_key(prompts, monkeypatch):
+    monkeypatch.setattr(dbtools.sys.stdin, "isatty", lambda: False, raising=False)
+    assert dbtools.get_login(True, False) == (None, None)
+    assert prompts == []
+
+
+def test_a_terminal_is_still_asked_for_the_key(prompts, monkeypatch):
+    monkeypatch.setattr(dbtools.sys.stdin, "isatty", lambda: True, raising=False)
+    dbtools.get_login(True, False)
+    assert prompts == ["NCBI api key (blank if none): "]
+
+
+def test_the_environment_key_is_cleaned_like_a_typed_one(prompts, monkeypatch):
+    monkeypatch.setenv("NCBI_API_KEY", "abc\n123 ")
+    assert dbtools.get_login(True, False)[0] == "abc123"
