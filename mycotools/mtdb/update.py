@@ -865,13 +865,39 @@ def clean_ncbi_df(
 
 
 def exec_rm_overlap(ncbi_df, todel_i):
-    """Execute the removal of JGI redundancy from NCBI genomes and create a
-    DataFrame that represents the overlapping genomes"""
+    """Execute the removal of JGI redundancy from NCBI genomes. Returns the NCBI
+    genomes that remain, then a DataFrame of the overlapping genomes removed.
+
+    Both callers unpack this as `ncbi_df, ncbi_jgi_overlap`, but it used to
+    return the two the other way round, so `ncbi_df` -- what the NCBI half of
+    the update downloads -- held the genomes taken for MycoCosm copies and
+    `ncbi_jgi_overlap` the NCBI-only ones. In the 2024-12-23 update all 173
+    genomes its NCBI half added were on its own list of MycoCosm copies
+    (redundant_ncbi.tsv, 1,563 accessions) though only about 10 MycoCosm
+    downloads had failed, and 0.31.17 has the same code: no NCBI-only genome
+    was ever added by an update."""
     todel = ncbi_df.index.intersection(todel_i)
-    ncbi_jgi_overlap = pd.DataFrame(columns=ncbi_df.columns)
     ncbi_jgi_overlap = ncbi_df.loc[todel]
     ncbi_df = ncbi_df.drop(todel)
-    return ncbi_jgi_overlap, ncbi_df
+    return ncbi_df, ncbi_jgi_overlap
+
+
+def known_ncbi_accessions(db, ncbi_df, true_ncbi):
+    """The NCBI accessions that are not to be taken for MycoCosm copies: the
+    ledger of accessions known to be NCBI-only, plus every listed accession of
+    an assembly the table already holds as an NCBI record. The ledger is keyed by
+    versioned accession, so the next version of a genome in it (GCA_x.1 to
+    GCA_x.2) was judged afresh by name heuristics and 18 of the 23 newer versions
+    of 2026-11-23 (S. cerevisiae Kyokai no. 7, C. auris B8441, ...) were taken
+    for MycoCosm copies and never updated."""
+    held = {
+        accession_base(acc)
+        for acc, src in zip(db["assembly_acc"], db["source"])
+        if src == "ncbi"
+    }
+    return set(true_ncbi) | {
+        acc for acc in ncbi_df["assembly_acc"] if accession_base(acc) in held
+    }
 
 
 def rm_ncbi_overlap(ncbi_df, mycocosm_df, jgi2ncbi, fails=set(), acc2meta={}, api=3):
@@ -1495,7 +1521,9 @@ def rogue_update(
                 todel_i = [x.rstrip() for x in raw]
             ncbi_df, ncbi_jgi_overlap = exec_rm_overlap(ncbi_df, todel_i)
         else:
-            true_ncbi = parse_true_ncbi(update_path + "../supported_ncbi.tsv")
+            true_ncbi = known_ncbi_accessions(
+                db, ncbi_df, parse_true_ncbi(update_path + "../supported_ncbi.tsv")
+            )
             ncbi_df, jgi2ncbi, jgi2biosample, true_ncbi, ncbi_jgi_overlap, todel_i = (
                 rm_ncbi_overlap(ncbi_df, jgi_df, jgi2ncbi, true_ncbi, acc2meta, api=api)
             )
