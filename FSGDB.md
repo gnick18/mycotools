@@ -46,8 +46,11 @@ TODO scaffolds, which is how the GFF break went unseen. Treat any command not li
   newer): 27 were already in the database, 1 was GCA_000002655.1 offered as an update over the FungiDB annotation `aspfum2.1`.
 * MycoCosm: with versions read on the same footing all 1,536 matched database genomes are at the catalog version (0 newer, 0 older),
   and the catalog marks no portal as superseded. The earlier "0 newer" was a result the check could not have failed to give.
-* An updated NCBI genome keeps its ome code (aspnig1 stays aspnig1; the old row leaves the reference before `gen_omes`). An updated
-  MycoCosm genome gets a new ome code. Both through a stubbed download, not a real swap.
+* ome codes of an updated genome: as `mtdb update` runs it (old row out of the reference, `previous_ome` blank) an updated genome gets a NEW code
+  (a real run of that sequence turned malglo1 into malglo2) and the old code is only retired. With the old row left in the reference and the old code
+  passed as `previous_ome`, `gen_omes` gives the next version of the code (malglo1 -> malglo1.1, aspnig7.1 -> aspnig7.2), which is how the table names
+  re-annotated genomes (aspfum2.1) and what the update DAG does. A first note here said the code was kept; that came from a stubbed test that skipped
+  the step which blanks `previous_ome`.
 * the two de-duplication checks on the real table: `internal_redundancy_check` removed 7 rows before (distinct isolates) and removes 0 of 6,907
   now; `redundancy_check` drops exactly the 23 genomes it replaces. An intermediate version that matched unversioned rows would have dropped 26
   more (the twins above); the unit tests pin that.
