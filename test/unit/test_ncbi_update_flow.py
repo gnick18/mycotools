@@ -2,10 +2,11 @@
 """The NCBI half of an update, from the redundancy check to the omes the genomes
 are given, with the download itself stubbed.
 
-* An updated genome is carried forward under its OLD ome code: the old row is
-  taken out of the reference database before the omes are generated, so
-  `gen_omes` has no reference row to bump (aspnig1 stays aspnig1, aspnig7.1
-  stays aspnig7.1). It replaces its predecessor in place.
+* `ncbi2db.main` puts the OLD ome of an updated genome in its `ome` column, but `mtdb update` then fills
+  every predb header the table lacks, `previous_ome` included, so the code never reaches `gen_omes`: the
+  updated genome gets a NEW code (aspnig1 is retired). Keeping the old row in the reference and passing the
+  old code as `previous_ome` gives the next version of the code (aspnig1.1), which is how the table names
+  re-annotated genomes (aspfum2.1). The update DAG does the latter.
 * When the download of an updated genome fails, its old row must come back.
   `ref_db.append(...)` raised AttributeError under pandas 2, so one failed
   download stopped the whole update.
@@ -60,7 +61,7 @@ def run(tmp_path, monkeypatch):
     return _run
 
 
-def test_an_updated_genome_keeps_its_ome_and_the_unchanged_ones_are_not_sent(run):
+def test_ncbi2db_carries_the_old_code_of_an_updated_genome_and_sends_only_what_changed(run):
     ncbi_df, ref_db, failed = run(
         ["GCA_000001.2", "GCA_000007.3", "GCA_000002.1", "GCA_000003.4", "GCA_000009.1"])
     assert list(ncbi_df["assembly_acc"]) == ["GCA_000001.2", "GCA_000007.3", "GCA_000009.1"]
@@ -70,16 +71,37 @@ def test_an_updated_genome_keeps_its_ome_and_the_unchanged_ones_are_not_sent(run
     assert failed == []
 
 
-def test_the_omes_generated_for_an_update_are_the_old_ones(run):
-    ncbi_df, ref_db, failed = run(["GCA_000001.2", "GCA_000007.3", "GCA_000009.1"])
+def _gen(ncbi_df, ref, blank_previous_ome):
+    """The codes gen_omes gives `ncbi_df`'s genomes against `ref`. `blank_previous_ome` is what
+    rogue_update does: it fills every predb header the table lacks, and `previous_ome` is one of them, so the
+    old code that ncbi2db.main put in `ome` never reaches gen_omes."""
     predb = ncbi_df.fillna("").copy()
     predb["version"] = predb["version"].astype(str)
-    omedb, bad = predb_mod.gen_omes(
-        predb_mod.predb2mtdb(predb.to_dict(orient="list")),
-        mtdb.pd2mtdb(ref_db), spacer="")
-    got = dict(zip(omedb["assembly_acc"], omedb["ome"]))
-    assert got["GCA_000001.2"] == "aspnig1"
-    assert got["GCA_000007.3"] == "aspnig7.1"
+    premtdb = predb.to_dict(orient="list")
+    if blank_previous_ome:
+        premtdb["previous_ome"] = ["" for _ in premtdb["assembly_acc"]]
+        premtdb["ome"] = ["" for _ in premtdb["assembly_acc"]]
+    omedb, bad = predb_mod.gen_omes(predb_mod.predb2mtdb(premtdb), mtdb.pd2mtdb(ref), spacer="")
+    return dict(zip(omedb["assembly_acc"], omedb["ome"]))
+
+
+def test_mtdb_update_gives_an_updated_ncbi_genome_a_new_code_not_its_old_one(run):
+    """As `mtdb update` runs it (old row out of the reference, previous_ome blank), GCA_000001.2 is not
+    aspnig1 again but the next free aspnig code, and aspnig1 is only retired. The code changes with the data."""
+    ncbi_df, ref_db, failed = run(["GCA_000001.2", "GCA_000007.3", "GCA_000009.1"])
+    got = _gen(ncbi_df, ref_db, blank_previous_ome=True)
+    assert got["GCA_000001.2"] not in {"aspnig1", "aspnig2", "aspnig7.1"}
+    assert got["GCA_000001.2"].startswith("aspnig") and "." not in got["GCA_000001.2"]
+
+
+def test_with_the_old_row_in_the_reference_an_update_is_the_next_version_of_its_code(run):
+    """What the table's own codes show (aspfum2 -> aspfum2.1): the old row stays in the reference while codes are
+    made and the old code is passed as previous_ome. The update DAG assigns codes this way."""
+    ncbi_df, ref_db, failed = run(["GCA_000001.2", "GCA_000007.3", "GCA_000009.1"])
+    full_ref = database(REF)
+    got = _gen(ncbi_df, full_ref, blank_previous_ome=False)
+    assert got["GCA_000001.2"] == "aspnig1.1"
+    assert got["GCA_000007.3"] == "aspnig7.2"
     assert got["GCA_000009.1"] not in {"aspnig1", "aspnig2", "aspnig7.1", "aspfis2"}
 
 
