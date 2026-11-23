@@ -20,7 +20,12 @@ import pytest
 import requests
 
 from mycotools.mtdb import update as mod
-from mycotools.utils.ncbi2db import accession_version, redundancy_check
+from mycotools.utils.ncbi2db import (
+    accession_base,
+    accession_version,
+    db_assembly_version,
+    redundancy_check,
+)
 
 
 def report(accession, release="2025-07-29", annotated="2025-07-29", genes=15310,
@@ -266,3 +271,102 @@ def test_a_database_version_that_is_not_a_date_no_longer_blocks_a_version_update
     db = database([("aspnig1", "GCA_000001.1", "1")])
     new, kept, updates, old = redundancy_check(db, listing(["GCA_000001.2"]), "assembly_acc")
     assert len(updates) == 1
+
+
+# --------------------------------------------------------------------------- #
+# databases hold accessions stored WITHOUT a version (490 of 6,907 genomes in
+# the 2025-04-30 database, e.g. GCA_000149645). They used to be cut at the
+# first "." (so GCA_000149645 became GCA_00014964), never met their own NCBI
+# record, and the record was fetched again as a new genome.
+
+
+def test_accession_base_keeps_an_unversioned_accession_whole():
+    assert accession_base("GCA_000149645.4") == "GCA_000149645"
+    assert accession_base("GCA_000149645") == "GCA_000149645"
+    assert accession_base("GCA_000149645.10") == "GCA_000149645"
+    assert accession_base("") == ""
+    assert accession_base(float("nan")) == "nan"
+    assert accession_base("GCA_000002655.v68FungiDB") == "GCA_000002655"
+    assert accession_base("Not_public_yet_DTO1") == "Not_public_yet_DTO1"
+    assert accession_base("Not_public_yet_DTO12") != accession_base("Not_public_yet_DTO1")
+
+
+def test_database_assembly_version_reads_the_suffix_then_the_version_field():
+    row = lambda acc, version: pd.Series({"assembly_acc": acc, "version": version})
+    assert db_assembly_version(row("GCA_1.7", "20200101000000")) == 7
+    assert db_assembly_version(row("GCA_000149645", "4")) == 4  # stored as a number
+    assert db_assembly_version(row("GCA_000149645", 4)) == 4
+    # no usable version: the oldest an assembly can be, so a newer one is never missed
+    assert db_assembly_version(row("GCA_000149645", "20200101000000")) == 1
+    assert db_assembly_version(row("GCA_000149645", "")) == 1
+    assert db_assembly_version(row("GCA_000149645", None)) == 1
+    assert db_assembly_version(row("GCA_000149645", "0")) == 1
+
+
+def test_an_unversioned_database_accession_meets_its_own_ncbi_record():
+    """The duplicate: same assembly, same version, fetched again as 'new'."""
+    db = database([("aspfis2", "GCA_000149645", "4")])
+    new, kept, updates, old = redundancy_check(db, listing(["GCA_000149645.4"]), "assembly_acc")
+    assert updates == [] and len(new) == 0 and list(kept["ome"]) == ["aspfis2"]
+
+
+def test_an_unversioned_accession_at_version_one_is_not_refetched():
+    db = database([("aspter13", "GCA_016808415", "1")])
+    new, kept, updates, old = redundancy_check(db, listing(["GCA_016808415.1"]), "assembly_acc")
+    assert updates == [] and len(new) == 0
+
+
+def test_a_newer_version_of_an_unversioned_database_accession_is_an_update():
+    db = database([("aspfis2", "GCA_000149645", "4")])
+    new, kept, updates, old = redundancy_check(db, listing(["GCA_000149645.5"]), "assembly_acc")
+    assert [u[0] for u in updates] == ["GCA_000149645"]
+    assert [u[3] for u in updates] == ["GCA_000149645.5"] and [u[4] for u in updates] == ["aspfis2"]
+    assert len(new) == 1 and "aspfis2" not in set(kept["ome"])
+
+
+def test_an_unversioned_accession_with_no_stored_number_is_updated_past_version_one_only():
+    db = database([("aspfis2", "GCA_000149645", "20160714000000")])
+    same, _, updates, _ = redundancy_check(db.copy(), listing(["GCA_000149645.1"]), "assembly_acc")
+    assert updates == [] and len(same) == 0
+    newer, _, updates, _ = redundancy_check(db.copy(), listing(["GCA_000149645.2"]), "assembly_acc")
+    assert [u[0] for u in updates] == ["GCA_000149645"] and len(newer) == 1
+
+
+def test_versions_compare_as_numbers_not_text():
+    db = database([("aspnig1", "GCA_000001.9", "20200101000000")])
+    new, kept, updates, old = redundancy_check(db, listing(["GCA_000001.10"]), "assembly_acc")
+    assert len(updates) == 1 and len(new) == 1
+
+
+def test_two_database_rows_of_one_assembly_collapse_into_one_update():
+    """A versioned and an unversioned copy of the same assembly: the newest
+    stands for it, both leave the database, one update is recorded."""
+    db = database([("aspnig1", "GCA_000001", "1"), ("aspnig2", "GCA_000001.2", "20200101000000")])
+    new, kept, updates, old = redundancy_check(db, listing(["GCA_000001.3"]), "assembly_acc")
+    assert len(updates) == 1 and updates[0][0] == "GCA_000001.2" and updates[0][4] == "aspnig2"
+    assert set(kept["ome"]) == set() and len(new) == 1
+
+
+def test_a_database_row_with_no_accession_does_not_stop_the_check():
+    db = database([("aspnig1", float("nan"), "1"), ("aspnig2", "GCA_000002.1", "20200101000000")])
+    new, kept, updates, old = redundancy_check(db, listing(["GCA_000002.2", "GCA_000009.1"]), "assembly_acc")
+    assert sorted(u[3] for u in updates) == ["GCA_000002.2", "GCA_000009.1"]
+    assert "aspnig1" in set(kept["ome"])
+
+
+def test_a_tagged_database_accession_is_the_same_assembly_not_a_new_one_or_an_update():
+    """aspfum2.1 holds FungiDB's annotation of GCA_000002655 under the accession
+    GCA_000002655.v68FungiDB. NCBI's GCA_000002655.1 is that assembly: it used to
+    be offered as an update that overwrote the curated entry; it must not become
+    a second Af293 either."""
+    db = database([("aspfum2.1", "GCA_000002655.v68FungiDB", "1")])
+    new, kept, updates, old = redundancy_check(db, listing(["GCA_000002655.1"]), "assembly_acc")
+    assert updates == [] and len(new) == 0 and list(kept["ome"]) == ["aspfum2.1"]
+    new, kept, updates, old = redundancy_check(db, listing(["GCA_000002655.2"]), "assembly_acc")
+    assert [u[0] for u in updates] == ["GCA_000002655.v68FungiDB"] and len(new) == 1
+
+
+def test_private_genomes_with_numbered_placeholders_are_not_confused_with_each_other():
+    db = database([("aspfis10", "Not_public_yet_DTO1", "1"), ("aspfis3", "Not_public_yet_DTO10", "1")])
+    new, kept, updates, old = redundancy_check(db, listing(["GCA_000001.1"]), "assembly_acc")
+    assert set(kept["ome"]) == {"aspfis10", "aspfis3"} and len(new) == 1

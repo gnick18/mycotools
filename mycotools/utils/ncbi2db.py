@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import copy
+import pandas as pd
 from datetime import datetime
 from mycotools.download.ncbi import main as ncbi_dwnld
 
@@ -24,18 +25,56 @@ def accession_version(accession):
     return int(found[1]) if found else 0
 
 
+def accession_base(accession):
+    """An assembly accession without its version (GCA_000001405.29 ->
+    GCA_000001405). One that carries no version is returned whole: cutting at
+    the first "." instead (`x[: x.find(".")]`) drops the last character of it,
+    so GCA_000149645 became GCA_00014964 and could never meet its own NCBI
+    record. A tag after the accession (the database's GCA_000002655.v68FungiDB,
+    a FungiDB annotation of the Af293 assembly) names the same assembly."""
+    text = str(accession)
+    found = re.match(r"(GC[AF]_\d+)(\.|$)", text)
+    return found[1] if found else re.sub(r"\.\d+$", "", text)
+
+
+def db_assembly_version(row):
+    """The version of the assembly a database row holds. It is the suffix of
+    the accession; 490 of the 6,907 genomes of the 2025-04-30 database were
+    stored without one (GCA_000149645), and for those the database's `version`
+    field holds the assembly version number (1, 2, 4), not a date. Where
+    neither says, 1: that is the oldest an assembly can be, so a newer NCBI
+    version is never missed, only possibly refetched."""
+    suffix = accession_version(row["assembly_acc"])
+    if suffix:
+        return suffix
+    stored = str(row.get("version", "")).strip()
+    if re.fullmatch(r"\d{1,3}", stored) and int(stored) > 0:
+        return int(stored)
+    return 1
+
+
+def restore_row(ref_db, old_row):
+    """Put a database row that redundancy_check removed back into the reference
+    database it returned (indexed by ome), as a row of that frame."""
+    row = old_row.drop(labels=["index"], errors="ignore")  # the frame's index name
+    restored = row.to_frame().T
+    restored.index = [row["ome"]]
+    restored.index.name = ref_db.index.name
+    return pd.concat([ref_db, restored])
+
+
 def redundancy_check(db, ncbi_df, ass_acc, duplicates={}):
     """should expect that ncbi_df (pd.DataFrame()) is only comprised of biosamples that are
     not overlapping with JGI"""
     db["index"], updates, old_rows = db.loc[:, "ome"], [], {}
-    db["versionless"] = [x[: x.find(".")] for x in list(db["assembly_acc"])]
+    db["versionless"] = [accession_base(x) for x in list(db["assembly_acc"])]
     assembly_accs = set(db["versionless"])
     # prepare a set of assembly accessions without the version tag
     todel_db, todel_ncbi = [], []
     for i, row in ncbi_df.iterrows():  # totally based on assembly accession and version
         organism = "_".join([row["genus"], row["species"], str(row["strain"])])
         assembly_acc = row[ass_acc]
-        assembly_acc_check = row[ass_acc][: row[ass_acc].find(".")]
+        assembly_acc_check = accession_base(assembly_acc)
         if assembly_acc_check in duplicates:  # special case duplicate
             todel_ncbi.append(i)
         elif assembly_acc_check in assembly_accs:  # assembly accession is in the
@@ -44,8 +83,7 @@ def redundancy_check(db, ncbi_df, ass_acc, duplicates={}):
             if len(check.index) > 1:  # multiple versions of the same accession
                 # in reference
                 versions = [
-                    int(re.search(r"\.(\d+)$", row["assembly_acc"])[1])
-                    for i, row in check.iterrows()
+                    db_assembly_version(check_row) for _, check_row in check.iterrows()
                 ]
                 indices = list(check.index)
                 max_v = max(versions)
@@ -82,9 +120,7 @@ def redundancy_check(db, ncbi_df, ass_acc, duplicates={}):
             # 4,254 genomes of the 2025-04-30 database that NCBI still lists
             # came out as updated, where the previous pipeline re-versioned 1
             # of 6,790 over the preceding three months.
-            if accession_version(assembly_acc) > accession_version(
-                db_row["assembly_acc"]
-            ):
+            if accession_version(assembly_acc) > db_assembly_version(db_row):
                 updates.append(
                     [
                         db_row["assembly_acc"],
@@ -207,7 +243,11 @@ def main(
         ncbi_df["source"] = "ncbi"
         for assembly_acc_info in failed:
             if assembly_acc_info[0] in update_check:
-                ref_db = ref_db.append(old_rows[assembly_acc_info[0]])
+                # the new version could not be fetched: the genome it was to
+                # replace goes back into the database. (`DataFrame.append`,
+                # used here before, no longer exists, so any failed update
+                # stopped the whole run with an AttributeError.)
+                ref_db = restore_row(ref_db, old_rows[assembly_acc_info[0]])
                 del update_check[
                     assembly_acc_info[0]
                 ]  # remove it from potential updates
@@ -215,6 +255,10 @@ def main(
         ref_db = ref_db.set_index("assembly_acc")  # update ome codes
         ncbi_df = ncbi_df.set_index("assembly_acc")
         for assembly_acc, update_d in update_check.items():
+            if assembly_acc not in ncbi_df.index:
+                # `.at` would add a row for an accession that was neither
+                # fetched nor reported failed
+                continue
             old_ome = update_d[-1]
             ncbi_df.at[assembly_acc, "ome"] = old_ome
 
