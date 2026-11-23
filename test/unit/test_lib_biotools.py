@@ -6,7 +6,9 @@ worked example of how to grow the per-script scaffolds beyond CLI smoke tests.
 """
 import pytest
 
-from mycotools.lib.biotools import fa2dict, dict2fa
+from mycotools.lib.biotools import (
+    fa2dict, dict2fa, gff2list, gff2features, list2gff, Feature, FeatureCol,
+)
 
 
 @pytest.fixture
@@ -49,5 +51,67 @@ def test_fa2dict_dict2fa_round_trip(sample_fasta, tmp_path):
 # --------------------------------------------------------------------------- #
 # TODO(scaffold): extend coverage of the other pure biotools parsers.
 # --------------------------------------------------------------------------- #
-@pytest.mark.skip(reason="TODO: scaffold - add gff2list / list2gff round-trip tests")
-def test_gff2list_list2gff_round_trip(): ...
+# --------------------------------------------------------------------------- #
+# gff2list / list2gff
+#
+# The Feature migration made `gff2list` return a FeatureCol built without
+# `ingest`, so it raised "No ID obtained for feature" on any GFF3, and the
+# consumers (predb curation, `mtdb accession gff|locus|gbk`, 32 call sites) all
+# index rows as dicts. Regenerating the 6,877-protein proteome of antflo1 from its
+# GFF3 and FNA gave back the database's proteome exactly once this was repaired.
+# --------------------------------------------------------------------------- #
+GFF = (
+    "##gff-version 3\n"
+    "ctg1\tsrc\tregion\t1\t500\t.\t+\t.\tID=r1\n"
+    "ctg1\tsrc\tgene\t11\t200\t.\t-\t.\tID=g1;Name=x\n"
+    "ctg1\tsrc\tmRNA\t11\t200\t.\t-\t.\tID=m1;Parent=g1\n"
+    "ctg1\tsrc\tCDS\t31\t180\t.\t-\t0\tID=c1;Parent=m1\n"
+)
+GFF_LINES = [l for l in GFF.split("\n") if l and not l.startswith("#")]
+
+
+def test_gff2list_returns_column_dicts():
+    rows = gff2list(GFF, path=False)
+    assert len(rows) == 4 and all(isinstance(r, dict) for r in rows)
+    assert rows[1] == {
+        "seqid": "ctg1", "source": "src", "type": "gene", "start": 11, "end": 200,
+        "score": ".", "strand": "-", "phase": ".", "attributes": "ID=g1;Name=x",
+    }
+
+
+def test_gff2list_rows_can_be_indexed_as_every_consumer_does():
+    row = gff2list(GFF, path=False)[2]
+    assert row["type"] == "mRNA" and "Parent=g1" in row["attributes"]
+
+
+def test_gff2list_reads_a_file_and_stops_at_the_fasta_directive(tmp_path):
+    path = tmp_path / "a.gff3"
+    path.write_text(GFF + "##FASTA\n>ctg1\nACGT\n")
+    assert len(gff2list(str(path))) == 4
+
+
+def test_gff2list_reports_a_short_row_and_a_bad_coordinate():
+    with pytest.raises(IndexError, match="expected tab-"):
+        gff2list("ctg1\tsrc\tgene\t1\t2\n", path=False)
+    with pytest.raises(ValueError, match="invalid integer"):
+        gff2list("ctg1\tsrc\tgene\tx\t2\t.\t+\t.\tID=a\n", path=False)
+
+
+def test_gff2list_list2gff_round_trip():
+    text = list2gff(gff2list(GFF, path=False), ver=3)
+    assert text == GFF.rstrip("\n")
+
+
+def test_list2gff_accepts_features_as_well_as_rows():
+    features = gff2features(GFF, path=False)
+    assert list2gff(features, ver=0).split("\n") == GFF_LINES
+
+
+def test_gff2features_derives_ids_parents_and_zero_based_coordinates():
+    features = gff2features(GFF, path=False)
+    assert isinstance(features, FeatureCol) and len(features) == 4
+    gene = features[1]
+    assert isinstance(gene, Feature)
+    assert (gene.fid, gene.pid) == ("g1", None)
+    assert (gene.start, gene.end) == (10, 200)  # GFF3 11..200, 0-based half-open
+    assert features[3].pid == "m1" and features[3].phase == 0

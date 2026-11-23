@@ -677,10 +677,9 @@ class FeatureCol:
                 f"{len(self.cds)} CDS, {len(self.exons)} exons)")
 
 
-# need to change into a class
-def gff2list(gff_info, path=True, error=True):
-
-    feature_list = []
+def _read_gff_columns(gff_info, path=True):
+    """The tab-split data lines of a GFF3 file (`path`) or string, up to a
+    ``##FASTA`` directive."""
     data = []
     if path:
         with open(gff_info, "r") as raw_gff:
@@ -697,6 +696,58 @@ def gff2list(gff_info, path=True, error=True):
                 data.append(d)
             elif line.startswith("##FASTA"):
                 break
+    return data
+
+
+def gff2list(gff_info, path=True, error=True):
+    """Read a GFF3 file (`path`) or string as a list of column dicts, each
+    value a string but for `start` and `end`, which are integers.
+
+    This is the form every consumer in mycotools was written for. The Feature
+    migration replaced it with a `FeatureCol` that none of them reads (they
+    index rows as dicts), which made every one of them raise; the Feature form
+    is `gff2features`."""
+    gff_list_dict = []
+    data = _read_gff_columns(gff_info, path)
+    try:
+        for col_list in data:
+            gff_list_dict.append(
+                {
+                    "seqid": col_list[0],
+                    "source": col_list[1],
+                    "type": col_list[2],
+                    "start": int(col_list[3]),
+                    "end": int(col_list[4]),
+                    "score": col_list[5],
+                    "strand": col_list[6],
+                    "phase": col_list[7],
+                    "attributes": col_list[8],
+                }
+            )
+    except IndexError:
+        raise IndexError(
+            str(len(col_list))
+            + "/9 expected tab-"
+            + "delimitted fields: "
+            + str(col_list)
+        )
+    except ValueError:
+        raise ValueError(
+            str(col_list[4:6]) + " invalid integer " + "conversion: " + str(col_list)
+        )
+
+    return gff_list_dict
+
+
+# need to change into a class
+def gff2features(gff_info, path=True, error=True):
+    """Read a GFF3 file (`path`) or string as a `FeatureCol` of `Feature`s.
+
+    Coordinates are converted to the 0-based, half-open form `Feature` keeps,
+    and each feature's ID and Parent are taken from its attributes."""
+
+    feature_list = []
+    data = _read_gff_columns(gff_info, path)
     try:
         for col_list in data:
             feature_list.append(
@@ -704,12 +755,13 @@ def gff2list(gff_info, path=True, error=True):
                     seqid = col_list[0],
                     source = col_list[1],
                     type = col_list[2],
-                    start = int(col_list[3]),
+                    start = int(col_list[3]) - 1,
                     end = int(col_list[4]),
                     score = col_list[5],
                     strand = col_list[6],
                     phase = col_list[7],
                     attributes = col_list[8],
+                    ingest = True,
                 )
             )
     except IndexError:
@@ -738,7 +790,10 @@ def list2gff(gff_list, ver=3):
     else:
         gff_str = ""
     for feature in gff_list:
-        gff_str += feature._to_gff_line() + "\n"
+        if isinstance(feature, dict):
+            gff_str += "\t".join(str(val) for val in feature.values()) + "\n"
+        else:
+            gff_str += feature._to_gff_line() + "\n"
 
     return gff_str.rstrip()
 
