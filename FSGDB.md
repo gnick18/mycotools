@@ -18,7 +18,7 @@ each also kept separate on this fork so any of them can be proposed upstream lat
 
 | `fix/gff2list-legacy-rows` | upstream's Feature migration (three commits, 2026-07-25) left `gff2list` returning a `FeatureCol` built without `ingest`, so it raised "No ID obtained for feature" on any GFF3, and none of its 32 consumers reads that form. `predb2mtdb` catches only `IndexError`, so no genome could be curated, and `mtdb accession gff/locus/gbk` failed too. `gff2list` returns dict rows again; the Feature reader is `gff2features` |
 | `fix/noninteractive-ncbi-key` | with no credential store the NCBI key was asked for with getpass, which raised `EOFError` in any job without a terminal (CHTC, cron); it is read from `NCBI_API_KEY` and asked for only on a terminal |
-| `fix/ncbi-version-updates` (on top of `fix/ncbi-enumerate-via-datasets-api`) | 490 of the 6,907 genomes of the 2025-04-30 database hold an accession with no version (`GCA_000149645`); the redundancy check cut it at the first `.`, dropping its last digit, so it never met its own NCBI record and that record was fetched again as a new genome (27 of the 1,885 "new" genomes on 2026-11-23 were already in the database). The version such a row holds is read from its `version` field. A failed download of an updated genome stopped the run (`DataFrame.append` is gone in pandas 2); its old row now goes back |
+| `fix/ncbi-version-updates` (on top of `fix/ncbi-enumerate-via-datasets-api`) | 490 of the 6,907 genomes of the 2025-04-30 database hold an accession with no version (`GCA_000149645`); the redundancy check cut it at the first `.`, dropping its last digit, so it never met its own NCBI record and that record was fetched again as a new genome (27 of the 1,885 "new" genomes on 2026-11-23 were already in the database). The version such a row holds is read from its `version` field. A failed download of an updated genome stopped the run (`DataFrame.append` is gone in pandas 2); its old row now goes back. `internal_redundancy_check`, which runs first in every update and writes the result back, cut accessions the same way and deleted 7 distinct *A. latus* isolates (`no_biosample_yet_8954-AG-0001`...); both checks now delete only a strictly older versioned copy or an exact repeat, never an unversioned twin (26 such twins, e.g. `paevar46` beside `paevar10`: same assembly and biosample, different annotation, kept by the lab) |
 | `fix/jgi-version-updates` (on top of `feat/jgi-seamless-token`) | the database stores a MycoCosm version without its dot (`10`, `20`, `316`) and the catalog says `1.0`, so a portal moving 1.0 to 2.0 was never an update (958 of the 1,536 matched genomes could not be flagged by any catalog change). An update that failed or is waiting on tape dropped the genome it was to replace (old row filed under the ome, looked up by portal) |
 
 `refactor-dev` is upstream's WORK IN PROGRESS (draft PR #17): its unit suite leaves most scripts as skipped
@@ -47,7 +47,10 @@ TODO scaffolds, which is how the GFF break went unseen. Treat any command not li
   and the catalog marks no portal as superseded. The earlier "0 newer" was a result the check could not have failed to give.
 * An updated NCBI genome keeps its ome code (aspnig1 stays aspnig1; the old row leaves the reference before `gen_omes`). An updated
   MycoCosm genome gets a new ome code. Both through a stubbed download, not a real swap.
-* unit suite with a temporary HOME: 424 passed, 8 failed (the same 8 as the untouched baseline), 3 skipped. Run it with
+* the two de-duplication checks on the real table: `internal_redundancy_check` removed 7 rows before (distinct isolates) and removes 0 of 6,907
+  now; `redundancy_check` drops exactly the 23 genomes it replaces. An intermediate version that matched unversioned rows would have dropped 26
+  more (the twins above); the unit tests pin that.
+* unit suite with a temporary HOME: 431 passed, 8 failed (the same 8 as the untouched baseline), 3 skipped. Run it with
   `env -u MYCODB HOME=$(mktemp -d)`: the `mtdb` subprocess tests otherwise resolve the real configured database.
 
 ### Why the NCBI re-version rule changed
