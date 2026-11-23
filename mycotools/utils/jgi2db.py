@@ -29,50 +29,69 @@ def compile_log(log_path):
     return log
 
 
+def parse_version(value):
+    """A MycoCosm portal version as (major, minor), from either way it is held.
+
+    The catalog gives "1.0", "2.0", "3.16". The database stores the same version
+    with its dot removed ("10", "20", "316": `predb2mtdb` strips every
+    non-word character), with "0" for none. Compared as numbers the two were never
+    alike, "2.0" never above "10", so a portal moving from 1.0 to 2.0 was not
+    seen as an update (958 of the 1,536 MycoCosm genomes of the 2025-04-30
+    database had a stored version the catalog could not exceed). A stored
+    version is read with its first digit as the major version, which is how all
+    1,536 of them match the catalog today. Anything unreadable is (0, 0)."""
+    if value is None:
+        return (0, 0)
+    if isinstance(value, (int, float, np.number)):
+        if pd.isnull(value):
+            return (0, 0)
+        value = str(int(value)) if float(value) == int(value) else str(value)
+    text = str(value).strip().lower().lstrip("v")
+    dotted = re.fullmatch(r"(\d+)\.(\d+)", text)
+    if dotted:
+        return (int(dotted[1]), int(dotted[2]))
+    if re.fullmatch(r"\d+", text):
+        return (int(text), 0) if len(text) == 1 else (int(text[0]), int(text[1:]))
+    return (0, 0)
+
+
+def organism_name(genus, species, strain):
+    """genus_species_strain, with an absent strain as empty rather than an error"""
+    return "_".join("" if pd.isnull(x) else str(x) for x in (genus, species, strain))
+
+
 def jgi_redundancy_check(db, jgi_df, duplicates={}, ome_col="portal", jgi2ncbi={}):
     '''everything in jgi_df (pd.DataFrame()) should be have a valid biosample
     at this point.
     db will have the index set at "assembly_acc"'''
 
-    db["version"].fillna(0.0)
     jgi_df["version"] = jgi_df.loc[:, "version"].replace(np.nan, "0.0")
     preOmes, biosamples = set(copy.deepcopy(db.index)), set(db["biosample"])
     updates, old_omes, todel_db, todel_jgi = {}, {}, [], []
 
     for i, row in jgi_df.iterrows():
-        #        version = float(row['version'].replace('v',''))
-        version = float(row["version"])
+        version = parse_version(row["version"])
         ome, biosample = (
             copy.deepcopy(row[ome_col]),
             row["biosample"],
         )  # implied to exist
+        organism = str(row["name"]).replace(" ", "_")
         if ome in duplicates:
             todel_jgi.append(i)
         elif ome in preOmes:
             db.at[ome, "published"] = copy.deepcopy(row["publication(s)"])
-            if pd.isnull(db["version"][ome]):
-                db.at[ome, "version"] = 0
             # update most current pub status
-            if not db["version"][ome] or pd.isnull(db["version"][ome]):
-                db.at[ome, "version"] = 0
-                db_version = 0
-            else:
-                try:
-                    db_version = float(db["version"][ome])
-                except (ValueError, AttributeError):
-                    db_version = float(db["version"][ome].replace("v", ""))
-                    db.at[ome, "version"] = db_version
+            if pd.isnull(db["version"][ome]):
+                db.at[ome, "version"] = "0"
+            db_version = parse_version(db["version"][ome])
             if version > db_version and db["source"][ome] == "jgi":
-                db_organism = (
-                    db.loc[ome, "genus"]
-                    + "_"
-                    + db.loc[ome, "species"]
-                    + "_"
-                    + db.loc[ome, "strain"]
+                db_organism = organism_name(
+                    db.loc[ome, "genus"], db.loc[ome, "species"], db.loc[ome, "strain"]
                 )
-                organism = jgi_df["name"].replace(" ", "_")
                 updates[ome] = [db.loc[ome, "ome"], db_organism, organism]
-                old_omes[db.loc[ome, "ome"]] = copy.deepcopy(db.loc[ome])
+                # the old row is filed under the portal, which is how the
+                # download step looks it up should the update not complete
+                old_omes[ome] = copy.deepcopy(db.loc[ome])
                 # retain row information
                 #                jgi_df.at[i, 'ome'] = db.at[ome, 'ome'] # keep the same ome code.
                 # I think this ought to be updated to a new code
@@ -87,14 +106,9 @@ def jgi_redundancy_check(db, jgi_df, duplicates={}, ome_col="portal", jgi2ncbi={
                 todel_jgi.append(i)
             else:  # this is an NCBI accession that can be updated to JGI
                 index = list(check_db.index)[0]
-                db_organism = (
-                    db.loc[index, "genus"]
-                    + "_"
-                    + db.loc[index, "species"]
-                    + "_"
-                    + db.loc[index, "strain"]
+                db_organism = organism_name(
+                    db.loc[index, "genus"], db.loc[index, "species"], db.loc[index, "strain"]
                 )
-                organism = jgi_df["name"].replace(" ", "_")
                 updates[ome] = [checkOme, db_organism, organism]
                 todel_db.append(index)
         elif ome.lower() in jgi2ncbi:  # NCBI can be updated to JGI
@@ -104,21 +118,14 @@ def jgi_redundancy_check(db, jgi_df, duplicates={}, ome_col="portal", jgi2ncbi={
                 check_db = db[db["assembly_acc"] == ncbi_acc]
                 checkOme = list(check_db["ome"])[0]
                 index = list(check_db.index)[0]
-                db_organism = (
-                    db.loc[index, "genus"]
-                    + "_"
-                    + db.loc[index, "species"]
-                    + "_"
-                    + db.loc[index, "strain"]
+                db_organism = organism_name(
+                    db.loc[index, "genus"], db.loc[index, "species"], db.loc[index, "strain"]
                 )
-                organism = jgi_df["name"].replace(" ", "_")
                 updates[ome] = [checkOme, db_organism, organism]
                 todel_db.append(index)
             else:
-                organism = jgi_df["name"].replace(" ", "_")
                 updates[ome] = [None, None, organism]
         else:
-            organism = jgi_df["name"].replace(" ", "_")
             updates[ome] = [None, None, organism]
 
     todel_db.sort(reverse=True)
@@ -397,13 +404,17 @@ def main(
     for ome_d in failed + deferred:
         ome = ome_d[0]
         if ome in old_rows:  # if there is an old row to add back
-            new_ref_db = new_ref_db.append(old_rows[ome])
+            # (`DataFrame.append` no longer exists under pandas 2)
+            restored = old_rows[ome].drop(labels=["index"], errors="ignore").to_frame().T
+            new_ref_db = pd.concat([new_ref_db, restored], ignore_index=True)
 
     old_assembly_accs = set(new_ref_db["assembly_acc"])
     jgi_df = jgi_df.set_index("assembly_acc")
     new_ref_db = new_ref_db.set_index("assembly_acc")
     for ome in updates:  # apply the old ome code to update the version
-        if ome in old_assembly_accs:
+        # (an update that was not fetched is no longer in jgi_df; `.at` would
+        # make up a row for it)
+        if ome in old_assembly_accs and ome in jgi_df.index:
             jgi_df.at[ome, "ome"] = new_ref_db.loc[ome, "ome"]
 
     jgi_df = jgi_df.astype(str)
