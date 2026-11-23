@@ -18,6 +18,8 @@ each also kept separate on this fork so any of them can be proposed upstream lat
 
 | `fix/gff2list-legacy-rows` | upstream's Feature migration (three commits, 2026-07-25) left `gff2list` returning a `FeatureCol` built without `ingest`, so it raised "No ID obtained for feature" on any GFF3, and none of its 32 consumers reads that form. `predb2mtdb` catches only `IndexError`, so no genome could be curated, and `mtdb accession gff/locus/gbk` failed too. `gff2list` returns dict rows again; the Feature reader is `gff2features` |
 | `fix/noninteractive-ncbi-key` | with no credential store the NCBI key was asked for with getpass, which raised `EOFError` in any job without a terminal (CHTC, cron); it is read from `NCBI_API_KEY` and asked for only on a terminal |
+| `fix/ncbi-version-updates` (on top of `fix/ncbi-enumerate-via-datasets-api`) | 490 of the 6,907 genomes of the 2025-04-30 database hold an accession with no version (`GCA_000149645`); the redundancy check cut it at the first `.`, dropping its last digit, so it never met its own NCBI record and that record was fetched again as a new genome (27 of the 1,885 "new" genomes on 2026-11-23 were already in the database). The version such a row holds is read from its `version` field. A failed download of an updated genome stopped the run (`DataFrame.append` is gone in pandas 2); its old row now goes back |
+| `fix/jgi-version-updates` (on top of `feat/jgi-seamless-token`) | the database stores a MycoCosm version without its dot (`10`, `20`, `316`) and the catalog says `1.0`, so a portal moving 1.0 to 2.0 was never an update (958 of the 1,536 matched genomes could not be flagged by any catalog change). An update that failed or is waiting on tape dropped the genome it was to replace (old row filed under the ome, looked up by portal) |
 
 `refactor-dev` is upstream's WORK IN PROGRESS (draft PR #17): its unit suite leaves most scripts as skipped
 TODO scaffolds, which is how the GFF break went unseen. Treat any command not listed under "Checked" below as unverified.
@@ -32,6 +34,21 @@ TODO scaffolds, which is how the GFF break went unseen. Treat any command not li
   database's; a genome released after the 2025-04-30 database (GCA_062053388.1) came out with 5,082 proteins, equal to NCBI's annotation count
 * the metadata half of `mtdb update` (NCBI listing, report fetch, redundancy check, MycoCosm catalog and overlap),
   with no genome downloaded; `mtdb update` itself was not run
+
+### Checked (2026-11-23, same scratch copy; finding newer versions of the same genome)
+
+* NCBI, against an independent oracle: Datasets was asked for every version of the 4,991 database accessions that
+  carry a GCA/GCF base (a different endpoint from the annotated listing the update reads). 29 have a newer version at NCBI;
+  the update flags 23 and no genome that is not newer (0 false positives). The 6 not flagged have no annotation on the newer
+  version, so there is nothing to curate. 3 database accessions are suppressed at NCBI with no current record.
+* Before the fix, the same listing and database gave 1,909 genomes to fetch (1,885 new + 24 newer); after, 1,881 (1,858 new + 23
+  newer): 27 were already in the database, 1 was GCA_000002655.1 offered as an update over the FungiDB annotation `aspfum2.1`.
+* MycoCosm: with versions read on the same footing all 1,536 matched database genomes are at the catalog version (0 newer, 0 older),
+  and the catalog marks no portal as superseded. The earlier "0 newer" was a result the check could not have failed to give.
+* An updated NCBI genome keeps its ome code (aspnig1 stays aspnig1; the old row leaves the reference before `gen_omes`). An updated
+  MycoCosm genome gets a new ome code. Both through a stubbed download, not a real swap.
+* unit suite with a temporary HOME: 424 passed, 8 failed (the same 8 as the untouched baseline), 3 skipped. Run it with
+  `env -u MYCODB HOME=$(mktemp -d)`: the `mtdb` subprocess tests otherwise resolve the real configured database.
 
 ### Why the NCBI re-version rule changed
 
@@ -58,6 +75,8 @@ the API lists.
 * the update's genome download stages (NCBI `datasets` download, MycoCosm restore and download) were not run for the new listing; only the metadata stages were
 * tape restore, assembly download and the interactive prompt have not been run live
 * nothing has been run on CHTC
+* a real swap of an updated genome (download, curation, `db2primary`) was run on neither side; only the stubbed flow and the unit tests
+* a MycoCosm portal that is superseded by another is not handled (the catalog lists none today)
 * `mtdb predb` and the update's `predb2mtdb` use the GFF reader on one genome of each kind only; the other readers of `gff2list` (gff/seq/phylo tools) were not run
 
 ## Rebuilding
@@ -68,6 +87,8 @@ the API lists.
     git merge --no-ff fix/ncbi-enumerate-via-datasets-api
     git merge --no-ff fix/gff2list-legacy-rows
     git merge --no-ff fix/noninteractive-ncbi-key
+    git merge --no-ff fix/ncbi-version-updates
+    git merge --no-ff fix/jgi-version-updates
 
 The first two merges conflict only in `test/unit/test_download_jgi.py`, where both sides append tests at
 the end; keep both blocks. When upstream takes one of the topic branches, drop it from this list
