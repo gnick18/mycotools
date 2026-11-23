@@ -65,6 +65,7 @@ from mycotools.download.ncbi import (
 )
 from mycotools.download.jgi import main as jgiDwnld
 from mycotools.utils.ncbi2db import main as ncbi2db
+from mycotools.utils.ncbi2db import accession_base, accession_version, db_assembly_version
 from mycotools.utils.jgi2db import main as jgi2db
 from mycotools.mtdb.predb import main as predb2mtdb
 from mycotools.mtdb.predb import predb_headers, read_predb, gen_omes
@@ -1028,30 +1029,37 @@ def internal_redundancy_check(db):
 
     ncbi_accs = defaultdict(list)
     for ome, row in ncbi_db.items():
-        ass_acc = row["assembly_acc"][: row["assembly_acc"].find(".")]
+        # (cutting at the first "." instead dropped the last character of an
+        # accession that has no version, so the seven distinct isolates
+        # no_biosample_yet_8954-AG-0001 ... -0018 of the 2025-04-30 database
+        # shared two keys and five of them were deleted as "versions")
+        ass_acc = accession_base(row["assembly_acc"])
         ncbi_accs[ass_acc].append(ome)
     red_ncbi = {k: v for k, v in ncbi_accs.items() if len(v) > 1}
     for ass_acc, omes in red_ncbi.items():
         omes = sorted(omes, reverse=True)  # large ome number to small
         accs = defaultdict(list)
         for ome in omes:
-            try:
-                acc_ver = int(
-                    ncbi_db[ome]["assembly_acc"][
-                        ncbi_db[ome]["assembly_acc"].find(".") + 1 :
-                    ]
-                )
-            except ValueError:
-                acc_ver = 0
+            acc_ver = db_assembly_version(ncbi_db[ome])
             accs[acc_ver].append(ome)
         max_ver = max(accs.keys())
-        for ver, omes in accs.items():
+        for ver, ver_omes in accs.items():
             if ver != max_ver:
-                for ome in omes:
-                    del db[ome]
+                # a superseded version goes, if it carries its own version; an
+                # unversioned copy is another curated entry for the assembly
+                for ome in ver_omes:
+                    if accession_version(ncbi_db[ome]["assembly_acc"]):
+                        del db[ome]
             else:
-                for ome in omes[1:]:
-                    del db[ome]
+                # at the newest version only an exact repeat of one accession
+                # goes, never a differently stored copy of it
+                seen = set()
+                for ome in ver_omes:
+                    acc = ncbi_db[ome]["assembly_acc"]
+                    if acc in seen:
+                        del db[ome]
+                    else:
+                        seen.add(acc)
 
     jgi_accs = defaultdict(list)
     for ome, row in jgi_db.items():
@@ -1069,13 +1077,23 @@ def internal_redundancy_check(db):
                 ver = 0
             accs[ver].append(ome)
         max_ver = max(accs.keys())
-        for ver, omes in accs.items():
+        for ver, ver_omes in accs.items():
             if ver != max_ver:
-                for ome in omes:
-                    del db[ome]
+                # a superseded version goes, if it carries its own version; an
+                # unversioned copy is another curated entry for the assembly
+                for ome in ver_omes:
+                    if accession_version(ncbi_db[ome]["assembly_acc"]):
+                        del db[ome]
             else:
-                for ome in omes[1:]:
-                    del db[ome]
+                # at the newest version only an exact repeat of one accession
+                # goes, never a differently stored copy of it
+                seen = set()
+                for ome in ver_omes:
+                    acc = ncbi_db[ome]["assembly_acc"]
+                    if acc in seen:
+                        del db[ome]
+                    else:
+                        seen.add(acc)
 
     return db2df(db.reset_index())
 

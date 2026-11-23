@@ -121,3 +121,68 @@ def test_an_update_the_downloader_neither_returned_nor_reported_adds_no_row(run)
         return df, []
     ncbi_df, ref_db, failed = run(["GCA_000001.2", "GCA_000009.1"], downloader=vanish)
     assert list(ncbi_df["assembly_acc"]) == ["GCA_000009.1"]
+
+
+# --------------------------------------------------------------------------- #
+# the database is de-duplicated before anything else in an update
+
+def test_distinct_accessions_without_a_version_are_not_taken_for_versions_of_one_genome():
+    """no_biosample_yet_8954-AG-0001 and -0007 are two isolates. Cut at the first
+    "." both became no_biosample_yet_8954-AG-000 and one was deleted; seven genomes
+    of the 2025-04-30 database went that way."""
+    from mycotools.mtdb import update as update_mod
+    rows = [(f"asplat{n}", f"no_biosample_yet_8954-AG-00{n:02d}", "1") for n in (1, 7, 8, 13, 14, 15, 17, 18, 19)]
+    kept = update_mod.internal_redundancy_check(database(rows))
+    assert sorted(kept["ome"]) == sorted(o for o, _, _ in rows)
+
+
+def test_two_versions_of_one_assembly_in_the_database_collapse_to_the_newest():
+    from mycotools.mtdb import update as update_mod
+    rows = [("aspnig1", "GCA_000001.1", "20200101000000"), ("aspnig2", "GCA_000001.2", "20200101000000"),
+            ("aspnig3", "GCA_000002", "4"), ("aspnig4", "GCA_000003.1", "20200101000000")]
+    kept = update_mod.internal_redundancy_check(database(rows))
+    assert sorted(kept["ome"]) == ["aspnig2", "aspnig3", "aspnig4"]
+
+
+# --------------------------------------------------------------------------- #
+# a separately curated unversioned copy of an assembly is never deleted by an update
+# (paevar10 = GCA_030061375.1 and paevar46 = the same assembly and biosample under
+# GCA_030061375, with its own annotation: 26 such pairs sit in the 2025-04-30 database)
+
+TWINS = [("paevar10", "GCA_030061375.1", "20230522000000"), ("paevar46", "GCA_030061375", "1")]
+
+
+def test_the_ncbi_check_leaves_an_unversioned_twin_alone_when_nothing_is_newer():
+    new, kept, updates, old = ncbi2db.redundancy_check(database(TWINS), listing(["GCA_030061375.1"]), "assembly_acc")
+    assert updates == [] and len(new) == 0
+    assert sorted(kept["ome"]) == ["paevar10", "paevar46"]
+
+
+def test_the_ncbi_check_replaces_only_the_row_that_is_updated():
+    new, kept, updates, old = ncbi2db.redundancy_check(database(TWINS), listing(["GCA_030061375.2"]), "assembly_acc")
+    assert [u[3] for u in updates] == ["GCA_030061375.2"] and len(new) == 1
+    assert len(updates) == 1 and updates[0][4] == "paevar10"
+    assert sorted(kept["ome"]) == ["paevar46"]
+
+
+def test_the_ncbi_check_still_drops_a_superseded_versioned_row():
+    rows = [("aspnig1", "GCA_000001.1", "20200101000000"), ("aspnig2", "GCA_000001.2", "20200101000000")]
+    new, kept, updates, old = ncbi2db.redundancy_check(database(rows), listing(["GCA_000001.2"]), "assembly_acc")
+    assert updates == [] and list(kept["ome"]) == ["aspnig2"]
+
+
+def test_the_database_check_keeps_unversioned_twins_and_drops_only_a_superseded_version():
+    from mycotools.mtdb import update as update_mod
+    kept = update_mod.internal_redundancy_check(database(TWINS))
+    assert sorted(kept["ome"]) == ["paevar10", "paevar46"]
+    rows = [("aspnig1", "GCA_000001.1", "20200101000000"), ("aspnig2", "GCA_000001.2", "20200101000000"),
+            ("aspnig3", "GCA_000001", "1")]
+    kept = update_mod.internal_redundancy_check(database(rows))
+    assert sorted(kept["ome"]) == ["aspnig2", "aspnig3"]  # the older versioned copy goes, the twin stays
+
+
+def test_the_database_check_collapses_an_exact_repeat_of_one_accession():
+    from mycotools.mtdb import update as update_mod
+    rows = [("aspnig1", "GCA_000001.1", "20200101000000"), ("aspnig2", "GCA_000001.1", "20200101000000")]
+    kept = update_mod.internal_redundancy_check(database(rows))
+    assert list(kept["ome"]) == ["aspnig2"]

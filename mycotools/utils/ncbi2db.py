@@ -99,10 +99,20 @@ def redundancy_check(db, ncbi_df, ass_acc, duplicates={}):
                     # duplicate versions with duplicate modification dates
                 else:
                     max_i = indices[versions.index(max_v)]
+                # only a row that carries its own version and is strictly older
+                # than the newest goes. An unversioned row stays: it is another
+                # copy of the assembly, curated separately (paevar10 holds
+                # GCA_030061375.1 and paevar46 the same assembly and biosample
+                # with its own annotation; 26 such copies sit in the 2025-04-30
+                # database), and it is not for an update to delete.
                 more_dels = [
-                    check.loc[v, "ome"] for i, v in enumerate(indices) if v != max_i
+                    check.loc[v, "ome"]
+                    for i, v in enumerate(indices)
+                    if v != max_i
+                    and accession_version(check.loc[v, "assembly_acc"])
+                    and versions[i] < max_v
                 ]
-                todel_db.extend(more_dels)  # delete the overlap
+                todel_db.extend(more_dels)  # delete the superseded versions
                 db_row = copy.deepcopy(check.loc[max_i])
             else:
                 db_row = copy.deepcopy(check.iloc[0])
