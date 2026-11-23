@@ -201,32 +201,49 @@ def dict2xmfa(xmfa_dict, description=True):
 
 
 def fa2dict(fasta_input):  # file_ = True):
-    fasta_dict = {}
+    # a sequence is gathered as a list of lines and joined once. Appending each line to the dictionary's string
+    # copies the whole sequence every time, which is quadratic in the length of a contig: one 38 Mb chromosome
+    # (Anisogramma anomala, GCA_062070544.1) kept a CHTC job busy for hours
+    fasta_dict, lines, seq_name = {}, [], None
     with open(fasta_input, "r") as raw:
         for line in raw:
             data = line.rstrip()
             if data.startswith(">"):
+                if seq_name is not None:
+                    fasta_dict[seq_name]["sequence"] = "".join(lines)
                 header = data[1:].split(" ")
                 seq_name = header[0]
+                lines = []
                 fasta_dict[seq_name] = {
                     "sequence": "",
                     "description": " ".join(header[1:]),
                 }
             elif not data.startswith("#"):
-                fasta_dict[seq_name]["sequence"] += data
+                if seq_name is None:
+                    raise UnboundLocalError("sequence before the first header in " + str(fasta_input))
+                lines.append(data)
+    if seq_name is not None:
+        fasta_dict[seq_name]["sequence"] = "".join(lines)
     return fasta_dict
 
 
 def fa2dict_str(fasta_input):
-    fasta_dict = {}
+    fasta_dict, lines, seq_name = {}, [], None
     for line in fasta_input.split("\n"):
         data = line.rstrip()
         if data.startswith(">"):
+            if seq_name is not None:
+                fasta_dict[seq_name]["sequence"] = "".join(lines)
             header = data[1:].split(" ")
             seq_name = header[0]
+            lines = []
             fasta_dict[seq_name] = {"sequence": "", "description": " ".join(header[1:])}
         elif not data.startswith("#"):
-            fasta_dict[seq_name]["sequence"] += data
+            if seq_name is None:
+                raise UnboundLocalError("sequence before the first header")
+            lines.append(data)
+    if seq_name is not None:
+        fasta_dict[seq_name]["sequence"] = "".join(lines)
     return fasta_dict
 
 
