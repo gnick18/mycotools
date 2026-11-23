@@ -674,6 +674,14 @@ def compile_genes(cur_list, ome, pseudocount=0, comps=gff3_comps(), cur_seqids=F
                     if id_dict[id_]:
                         for rna, alias in id_dict[id_].items():
                             alias_tag += alias + "|"
+                        # an mRNA with no CDS beside mRNAs that have one (a transcript the annotator gave no
+                        # protein) still needs an alias of its own, or its exons cannot be placed
+                        for rna in mrnas[id_]:
+                            if rna not in id_dict[id_]:
+                                alias = ome + "_etc" + str(etc_counts["etc"])
+                                etc_counts["etc"] += 1
+                                id_dict[id_][rna] = alias
+                                alias_tag += alias + "|"
                     else:  # no CDS associated with mRNA
                         alias = ome + "_etc" + str(etc_counts["etc"])
                         alias_tag += alias + "|"
@@ -938,6 +946,11 @@ def rename_and_organize(gff_list):
         entry["attributes"] = re.sub(
             gff3_comps()["id"], "ID=" + oth_id, entry["attributes"]
         )
+        gene_alias = None
+        if alias not in alias2rnaid and alias not in alias2geneid and "|" in alias:
+            # a feature of a gene with several RNAs (a UTR, say) carries all of the gene's aliases, joined:
+            # it belongs to the gene, not to one of the RNAs
+            gene_alias = next((a for a in alias.split("|") if a in alias2geneid), None)
         if alias in alias2rnaid:
             par_id = alias2rnaid[alias]
             gene_id = alias2geneid[alias]
@@ -945,8 +958,8 @@ def rename_and_organize(gff_list):
                 gff3_comps()["par"], "Parent=" + par_id, entry["attributes"]
             )
             scaf2gene2entries[entry["seqid"]][gene_id]["rna"][alias].append(entry)
-        elif alias in alias2geneid:
-            par_id = alias2geneid[alias]
+        elif alias in alias2geneid or gene_alias is not None:
+            par_id = alias2geneid[gene_alias or alias]
             entry["attributes"] = re.sub(
                 gff3_comps()["par"], "Parent=" + par_id, entry["attributes"]
             )
@@ -993,8 +1006,143 @@ def rename_and_organize(gff_list):
     return out_gff
 
 
+def normalize_gene_children(gff_list):
+    """Put the features that hang off a gene into the gene > RNA > exon/CDS shape the curator expects.
+
+    ENA/EMBL-sourced GFF3s (accessions GCA_9..., about a sixth of the NCBI genomes added since 2020) and a few
+    older GenBank ones break three of the curator's assumptions, and one such feature fails the whole genome:
+
+    1. A second exon is parented directly to the gene (ID=id-<locus>, gbkey=exon) with the coordinates of an
+       exon of one of the gene's RNAs. For a protein-coding gene the curator folds it into the mRNA as a repeated
+       exon. For a tRNA, rRNA or other non-coding gene there is no mRNA to fold it into, it gets no alias, and
+       curation stops. An exon is removed only when it repeats an exon of one of the gene's RNAs exactly
+       (same sequence, start, end and strand), so no annotation is lost.
+    2. A CDS is parented to a gene that also has an RNA (a pseudogene's CDS, or a second protein of a locus).
+       The curator needs a CDS to follow an RNA parent, so these CDSs are given one. If the gene has exactly one
+       RNA and that RNA has no CDS of its own, the CDSs are re-parented to it. Otherwise each protein among them
+       gets a new mRNA under the same gene, as the curator already does for a gene with CDSs and no RNA.
+    3. One mRNA carries the CDSs of two or more different proteins (ORF1 and ORF2 of a retrotransposon, say).
+       The curator keeps one alias per mRNA, so the proteins after the first each get a new mRNA under the gene.
+
+    "Protein" means the protein_id of the CDS, or its ID where it has none, so the segments of one coding
+    sequence stay together. Every CDS is kept, so the proteome is not shortened by this step.
+
+    Returns (new list, {"exons_removed": n, "cds_reparented": n, "mrnas_added": n}). The input is not modified.
+    """
+    comps = gff3_comps()
+    id_re, par_re, prot_re = (re.compile(comps[k]) for k in ("id", "par", "prot"))
+
+    def _id(entry):
+        m = id_re.search(entry["attributes"])
+        return m[1] if m else None
+
+    def _par(entry):
+        m = par_re.search(entry["attributes"])
+        return m[1] if m else None
+
+    def _prot(entry):
+        m = prot_re.search(entry["attributes"])
+        return (m[1] or m[2]) if m else _id(entry)
+
+    def _is_rna(entry):
+        return "RNA" in entry["type"] or entry["type"] == "transcript"
+
+    def _span(entry):
+        return (entry["seqid"], int(entry["start"]), int(entry["end"]), entry["strand"])
+
+    rna2gene, rna_entry, gene_rnas = {}, {}, defaultdict(list)
+    for entry in gff_list:
+        if _is_rna(entry):
+            id_, par = _id(entry), _par(entry)
+            if id_ and par:
+                rna2gene[id_] = par
+                rna_entry[id_] = entry
+                gene_rnas[par].append(id_)
+
+    exon_keys, rna_cds = defaultdict(set), defaultdict(list)
+    for entry in gff_list:
+        par = _par(entry)
+        if par in rna2gene:
+            if entry["type"] == "exon":
+                exon_keys[rna2gene[par]].add(_span(entry))
+            elif entry["type"] == "CDS":
+                rna_cds[par].append(entry)
+
+    counts = {"exons_removed": 0, "cds_reparented": 0, "mrnas_added": 0}
+    gene_cds, kept = defaultdict(list), []
+    for entry in gff_list:
+        par = _par(entry)
+        if par in gene_rnas:
+            if entry["type"] == "exon" and _span(entry) in exon_keys[par]:
+                counts["exons_removed"] += 1
+                continue
+            if entry["type"] == "CDS":
+                gene_cds[par].append(entry)
+                continue
+        kept.append(entry)
+
+    def new_mrna(rna_id, gene, members, template=None):
+        first = members[0]
+        coords = [int(c[k]) for c in members for k in ("start", "end")]
+        counts["mrnas_added"] += 1
+        return {
+            "seqid": first["seqid"], "source": first["source"], "type": "mRNA",
+            "start": min(coords), "end": max(coords), "score": ".", "strand": first["strand"], "phase": ".",
+            "attributes": f"ID={rna_id};Parent={gene};gbkey=mRNA",
+        }
+
+    def reparent(members, rna_id):
+        counts["cds_reparented"] += len(members)
+        return [dict(c, attributes=par_re.sub("Parent=" + rna_id, c["attributes"], count=1)) for c in members]
+
+    after, moved = defaultdict(list), set()  # RNA ID -> entries written right after it; CDS entries taken out of place
+    for gene, cdss in gene_cds.items():  # rule 2
+        rnas = gene_rnas[gene]
+        if len(rnas) == 1 and not rna_cds.get(rnas[0]):
+            after[rnas[0]].extend(reparent(cdss, rnas[0]))
+            continue
+        by_prot = defaultdict(list)
+        for cds in cdss:
+            by_prot[_prot(cds)].append(cds)
+        stem = gene[5:] if gene.startswith("gene-") else gene
+        for k, members in enumerate(by_prot.values(), 1):
+            rna_id = f"rna-{stem}-cds{k}"
+            after[rnas[-1]].append(new_mrna(rna_id, gene, members))
+            after[rnas[-1]].extend(reparent(members, rna_id))
+    for rna, cdss in rna_cds.items():  # rule 3
+        if rna_entry[rna]["type"] != "mRNA":
+            continue
+        by_prot = defaultdict(list)
+        for cds in cdss:
+            by_prot[_prot(cds)].append(cds)
+        if len(by_prot) < 2:
+            continue
+        for k, members in enumerate(list(by_prot.values())[1:], 2):
+            rna_id = f"{rna}-p{k}"
+            after[rna].append(new_mrna(rna_id, rna2gene[rna], members))
+            after[rna].extend(reparent(members, rna_id))
+            moved.update(id(c) for c in members)
+
+    if not after:
+        return kept, counts
+    ordered = []
+    for entry in kept:
+        if id(entry) in moved:
+            continue
+        ordered.append(entry)
+        id_ = _id(entry)
+        if id_ in after and _is_rna(entry):
+            ordered.extend(after.pop(id_))
+    for leftover in after.values():  # cannot happen when every RNA entry has an ID; keep the CDSs anyway
+        ordered.extend(leftover)
+    return ordered, counts
+
+
 def cur_gff3(gff_list, ome, cur_seqids=False):
 
+    gff_list, changed = normalize_gene_children(gff_list)
+    if any(changed.values()):
+        logger.info("%s: normalised gene children: %s", ome, changed)
     cur_list, intron = [], False
     for line in gff_list:
         if line["type"] == "intron":
