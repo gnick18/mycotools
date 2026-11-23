@@ -21,6 +21,7 @@ each also kept separate on this fork so any of them can be proposed upstream lat
 | `fix/ncbi-version-updates` (on top of `fix/ncbi-enumerate-via-datasets-api`) | 490 of the 6,907 genomes of the 2025-04-30 database hold an accession with no version (`GCA_000149645`); the redundancy check cut it at the first `.`, dropping its last digit, so it never met its own NCBI record and that record was fetched again as a new genome (27 of the 1,885 "new" genomes on 2026-11-23 were already in the database). The version such a row holds is read from its `version` field. A failed download of an updated genome stopped the run (`DataFrame.append` is gone in pandas 2); its old row now goes back. `internal_redundancy_check`, which runs first in every update and writes the result back, cut accessions the same way and deleted 7 distinct *A. latus* isolates (`no_biosample_yet_8954-AG-0001`...); both checks now delete only a strictly older versioned copy or an exact repeat, never an unversioned twin (26 such twins, e.g. `paevar46` beside `paevar10`: same assembly and biosample, different annotation, kept by the lab) |
 | `fix/jgi-version-updates` (on top of `feat/jgi-seamless-token`) | the database stores a MycoCosm version without its dot (`10`, `20`, `316`) and the catalog says `1.0`, so a portal moving 1.0 to 2.0 was never an update (958 of the 1,536 matched genomes could not be flagged by any catalog change). An update that failed or is waiting on tape dropped the genome it was to replace (old row filed under the ome, looked up by portal) |
 | `fix/ncbi-overlap-order` (on top of `fix/ncbi-version-updates`) | `exec_rm_overlap` returned (overlap, remaining) and both callers unpacked (ncbi_df, overlap), so the NCBI half of an update downloaded the genomes taken for MycoCosm copies and never the NCBI-only ones (0.31.17 has the same two lines). Proof in the lab's own files: the 2024-12-23 update added 173 genomes through its NCBI half and all 173 are on its `redundant_ncbi.tsv` list of copies, with ~10 MycoCosm failures. `known_ncbi_accessions()` also stops the next version of a genome the table holds as an NCBI record from being taken for a MycoCosm copy (18 of 23 newer versions were) |
+| `fix/gff3-gene-level-children` (touches only `cur_gff3.py`, identical in upstream, so it applies there unchanged) | GFF3s that hang features off a gene instead of its RNA made `rename_and_organize` raise, and `predb` answers a raise by dropping the whole genome. In a 75-genome NCBI test 13 genomes failed this way (11 of the 12 recent ENA/EMBL-sourced `GCA_9...` ones and 2 older GenBank ones). Now: (1) an exon repeated under a gene with the coordinates of an exon of its RNA is removed, (2) a CDS parented to a gene that has an RNA is re-parented to that RNA, or to a new mRNA under the gene when the RNA has its own CDS, (3) a second protein on one mRNA gets its own mRNA, (4) an mRNA with no CDS beside one that has a protein gets an alias, (5) a UTR carrying all of a multi-mRNA gene's aliases is placed under the gene. No CDS is dropped |
 
 `refactor-dev` is upstream's WORK IN PROGRESS (draft PR #17): its unit suite leaves most scripts as skipped
 TODO scaffolds, which is how the GFF break went unseen. Treat any command not listed under "Checked" below as unverified.
@@ -56,6 +57,21 @@ TODO scaffolds, which is how the GFF break went unseen. Treat any command not li
   more (the twins above); the unit tests pin that.
 * unit suite with a temporary HOME: 431 passed, 8 failed (the same 8 as the untouched baseline), 3 skipped. Run it with
   `env -u MYCODB HOME=$(mktemp -d)`: the `mtdb` subprocess tests otherwise resolve the real configured database.
+
+### `fix/gff3-gene-level-children` (2026-11-23)
+
+* all 13 genomes that failed GFF3 curation in the 75-genome CHTC test now curate (before: 0 of 13). Their curated GFF3s were
+  translated against the genome with the same `gff2seq` call `predb` makes: 7 give exactly NCBI's protein-coding count, and the other 6
+  give more, never fewer (+1, +2, +36, +89, +154, +232; the pseudogene counts NCBI lists are 11, 12, 32, 89, 23 and 128, and a pseudogene's CDS is
+  kept as `<ome>_pseudogeneN` like the 11 in `spogra2`). No sequence translated blank.
+* no regression: 28 other genomes (24 that curated in the CHTC test, 4 RefSeq) were curated with the unfixed and the fixed module and the output
+  hashed. 26 are byte-identical. `GCA_910592135.1` differs only in its exons: its 53,369 exons that had been written twice (the gene-level
+  repeat folded into the mRNA) are written once, with genes (19,906), mRNAs and CDSs (53,369) unchanged. `GCF_000146045.2` (S. cerevisiae S288C)
+  raised `TypeError` before and curates now.
+* 12 new tests (`test/unit/test_gff3_gene_children.py`) cut the shapes down from the failing files; 8 of them fail on the unfixed module, the
+  other 4 pin that a GFF3 in the expected shape is left alone. Whole unit suite: 448 passed, 8 failed, 3 skipped, the same 8 as the untouched
+  baseline.
+* not covered: the other ~200 ENA-style genomes of the planned 1,322 have not been curated. Some may carry a shape these 13 do not.
 
 **Retraction (2026-11-23):** the earlier "568 NCBI genomes to add, 125 released after the database" came from the swapped sets above. With
 `fix/ncbi-overlap-order` the same listing and the lab's real ledgers give 1,322 NCBI genomes (1,299 new, 23 newer versions, 698 of the new ones
@@ -102,6 +118,7 @@ the API lists.
     git merge --no-ff fix/ncbi-version-updates
     git merge --no-ff fix/jgi-version-updates
     git merge --no-ff fix/ncbi-overlap-order
+    git merge --no-ff fix/gff3-gene-level-children
 
 The first two merges conflict only in `test/unit/test_download_jgi.py`, where both sides append tests at
 the end; keep both blocks. When upstream takes one of the topic branches, drop it from this list
