@@ -1009,25 +1009,28 @@ def rename_and_organize(gff_list):
 def normalize_gene_children(gff_list):
     """Put the features that hang off a gene into the gene > RNA > exon/CDS shape the curator expects.
 
-    ENA/EMBL-sourced GFF3s (accessions GCA_9..., about a sixth of the NCBI genomes added since 2020) and a few
-    older GenBank ones break three of the curator's assumptions, and one such feature fails the whole genome:
+    ENA/EMBL-sourced GFF3s (accessions GCA_9... and many older EMBL/GenBank ones) break the curator's assumptions
+    in several ways, and one such feature fails the whole genome. Each rule below acts only on a shape the curator
+    cannot place, so a GFF3 that already curates is returned unchanged. A "protein" is the protein_id of a CDS, or
+    its ID where it has none, so the segments of one coding sequence stay together. Every CDS is kept.
 
-    1. A second exon is parented directly to the gene (ID=id-<locus>, gbkey=exon) with the coordinates of an
-       exon of one of the gene's RNAs. For a protein-coding gene the curator folds it into the mRNA as a repeated
-       exon. For a tRNA, rRNA or other non-coding gene there is no mRNA to fold it into, it gets no alias, and
-       curation stops. An exon is removed only when it repeats an exon of one of the gene's RNAs exactly
-       (same sequence, start, end and strand), so no annotation is lost.
-    2. A CDS is parented to a gene that also has an RNA (a pseudogene's CDS, or a second protein of a locus).
-       The curator needs a CDS to follow an RNA parent, so these CDSs are given one. If the gene has exactly one
-       RNA and that RNA has no CDS of its own, the CDSs are re-parented to it. Otherwise each protein among them
-       gets a new mRNA under the same gene, as the curator already does for a gene with CDSs and no RNA.
-    3. One mRNA carries the CDSs of two or more different proteins (ORF1 and ORF2 of a retrotransposon, say).
-       The curator keeps one alias per mRNA, so the proteins after the first each get a new mRNA under the gene.
+    1. An exon is parented to a gene that has an RNA. An exact repeat of an exon of one of the gene's RNAs is
+       removed (a tRNA or rRNA gene has no mRNA to fold it into). Other such exons are the gene's own exon list
+       when its one RNA carries only a single exon spanning the whole gene (that placeholder exon is replaced by
+       them), and are removed otherwise (a whole-gene placeholder next to an RNA with its real exons).
+    2. A CDS is parented to a gene that also has an RNA (a pseudogene's CDS, or a second protein of a locus). If
+       the gene has exactly one RNA and that RNA has no CDS of its own, the first protein goes to it. Every other
+       protein gets a new mRNA under the gene, as the curator already does for a gene with CDSs and no RNA.
+    3. One mRNA carries the CDSs of two or more proteins (ORF1 and ORF2 of a retrotransposon, say). The curator
+       keeps one alias per mRNA, so the proteins after the first each get a new mRNA under the gene.
+    4. A gene with no RNA has CDSs and also exons or introns, or has CDSs of two or more proteins (mitochondrial
+       genes with introns, S. pombe). Each protein gets a new mRNA with exons: the gene's own exons when there is
+       one protein, otherwise one exon per CDS segment. The gene's introns are dropped (they only describe the
+       exons). A gene with exons and no CDS gets one mRNA over its exons, and a gene with nothing but introns
+       (a non-coding feature of a mitochondrial genome) loses them.
 
-    "Protein" means the protein_id of the CDS, or its ID where it has none, so the segments of one coding
-    sequence stay together. Every CDS is kept, so the proteome is not shortened by this step.
-
-    Returns (new list, {"exons_removed": n, "cds_reparented": n, "mrnas_added": n}). The input is not modified.
+    Returns (new list, {"exons_removed", "exons_replaced", "cds_reparented", "mrnas_added", "exons_added", "introns_removed"}).
+    The input list is not modified.
     """
     comps = gff3_comps()
     id_re, par_re, prot_re = (re.compile(comps[k]) for k in ("id", "par", "prot"))
@@ -1050,90 +1053,147 @@ def normalize_gene_children(gff_list):
     def _span(entry):
         return (entry["seqid"], int(entry["start"]), int(entry["end"]), entry["strand"])
 
-    rna2gene, rna_entry, gene_rnas = {}, {}, defaultdict(list)
+    genes, rna2gene, rna_entry, gene_rnas = {}, {}, {}, defaultdict(list)
     for entry in gff_list:
-        if _is_rna(entry):
-            id_, par = _id(entry), _par(entry)
+        id_ = _id(entry)
+        if entry["type"] in ("gene", "pseudogene") and id_:
+            genes[id_] = entry
+        elif _is_rna(entry):
+            par = _par(entry)
             if id_ and par:
                 rna2gene[id_] = par
                 rna_entry[id_] = entry
                 gene_rnas[par].append(id_)
 
-    exon_keys, rna_cds = defaultdict(set), defaultdict(list)
+    rna_exons, rna_cds, gene_kids = defaultdict(list), defaultdict(list), defaultdict(list)
     for entry in gff_list:
         par = _par(entry)
         if par in rna2gene:
             if entry["type"] == "exon":
-                exon_keys[rna2gene[par]].add(_span(entry))
+                rna_exons[par].append(entry)
             elif entry["type"] == "CDS":
                 rna_cds[par].append(entry)
+        elif par in genes and entry["type"] in ("exon", "CDS", "intron"):
+            gene_kids[par].append(entry)
 
-    counts = {"exons_removed": 0, "cds_reparented": 0, "mrnas_added": 0}
-    gene_cds, kept = defaultdict(list), []
-    for entry in gff_list:
-        par = _par(entry)
-        if par in gene_rnas:
-            if entry["type"] == "exon" and _span(entry) in exon_keys[par]:
-                counts["exons_removed"] += 1
-                continue
-            if entry["type"] == "CDS":
-                gene_cds[par].append(entry)
-                continue
-        kept.append(entry)
+    counts = dict(exons_removed=0, exons_replaced=0, cds_reparented=0, mrnas_added=0, exons_added=0, introns_removed=0)
+    removed = set()                      # id() of entries taken out of place
+    after_rna, after_gene = defaultdict(list), defaultdict(list)   # entries written right after an RNA / a gene
 
-    def new_mrna(rna_id, gene, members, template=None):
-        first = members[0]
+    def by_protein(cdss):
+        groups = defaultdict(list)
+        for cds in cdss:
+            groups[_prot(cds)].append(cds)
+        return list(groups.values())
+
+    def new_mrna(rna_id, gene, members, pseudo=False):
         coords = [int(c[k]) for c in members for k in ("start", "end")]
+        first = members[0]
         counts["mrnas_added"] += 1
         return {
             "seqid": first["seqid"], "source": first["source"], "type": "mRNA",
             "start": min(coords), "end": max(coords), "score": ".", "strand": first["strand"], "phase": ".",
-            "attributes": f"ID={rna_id};Parent={gene};gbkey=mRNA",
+            "attributes": f"ID={rna_id};Parent={gene};gbkey=mRNA" + (";pseudo=true" if pseudo else ""),
         }
 
     def reparent(members, rna_id):
         counts["cds_reparented"] += len(members)
         return [dict(c, attributes=par_re.sub("Parent=" + rna_id, c["attributes"], count=1)) for c in members]
 
-    after, moved = defaultdict(list), set()  # RNA ID -> entries written right after it; CDS entries taken out of place
-    for gene, cdss in gene_cds.items():  # rule 2
-        rnas = gene_rnas[gene]
-        if len(rnas) == 1 and not rna_cds.get(rnas[0]):
-            after[rnas[0]].extend(reparent(cdss, rnas[0]))
-            continue
-        by_prot = defaultdict(list)
-        for cds in cdss:
-            by_prot[_prot(cds)].append(cds)
+    def exon_like(template, rna_id, ident, start, end):
+        counts["exons_added"] += 1
+        return {"seqid": template["seqid"], "source": template["source"], "type": "exon", "start": start, "end": end,
+                "score": ".", "strand": template["strand"], "phase": ".",
+                "attributes": f"ID={ident};Parent={rna_id};gbkey=mRNA"}
+
+    for gene, gx in genes.items():
         stem = gene[5:] if gene.startswith("gene-") else gene
-        for k, members in enumerate(by_prot.values(), 1):
-            rna_id = f"rna-{stem}-cds{k}"
-            after[rnas[-1]].append(new_mrna(rna_id, gene, members))
-            after[rnas[-1]].extend(reparent(members, rna_id))
-    for rna, cdss in rna_cds.items():  # rule 3
+        rnas = gene_rnas.get(gene, [])
+        kids = gene_kids.get(gene, [])
+        exons = [k for k in kids if k["type"] == "exon"]
+        cdss = [k for k in kids if k["type"] == "CDS"]
+        introns = [k for k in kids if k["type"] == "intron"]
+        if rnas:
+            repeats = {_span(e) for r in rnas for e in rna_exons[r]}
+            for e in exons:                                                        # rule 1
+                if _span(e) in repeats:
+                    removed.add(id(e)); counts["exons_removed"] += 1
+            rest = [e for e in exons if _span(e) not in repeats]
+            if rest:
+                only = rna_exons[rnas[0]] if len(rnas) == 1 else []
+                if len(only) == 1 and (int(only[0]["start"]), int(only[0]["end"])) == (int(gx["start"]), int(gx["end"])):
+                    removed.add(id(only[0])); counts["exons_replaced"] += 1
+                    after_rna[rnas[0]].extend(
+                        dict(e, attributes=par_re.sub("Parent=" + rnas[0], e["attributes"], count=1)) for e in rest)
+                    removed.update(id(e) for e in rest)
+                else:
+                    removed.update(id(e) for e in rest); counts["exons_removed"] += len(rest)
+            if cdss:                                                               # rule 2
+                groups = by_protein(cdss)
+                removed.update(id(c) for c in cdss)
+                if len(rnas) == 1 and not rna_cds.get(rnas[0]):
+                    after_rna[rnas[0]].extend(reparent(groups[0], rnas[0]))
+                    groups = groups[1:]
+                for k, members in enumerate(groups, 1):
+                    rna_id = f"rna-{stem}-cds{k}"
+                    after_rna[rnas[-1]].append(new_mrna(rna_id, gene, members))
+                    after_rna[rnas[-1]].extend(reparent(members, rna_id))
+            continue
+        # a gene with no RNA                                                       # rule 4
+        groups = by_protein(cdss)
+        if cdss and (len(groups) >= 2 or exons or introns):
+            removed.update(id(k) for k in kids)
+            for k, members in enumerate(groups, 1):
+                rna_id = f"rna-{stem}-cds{k}"
+                if len(groups) == 1 and exons:
+                    parts = exons
+                    block = [new_mrna(rna_id, gene, members + exons, gx["type"] == "pseudogene")]
+                    block.extend(dict(e, attributes=par_re.sub("Parent=" + rna_id, e["attributes"], count=1)) for e in exons)
+                else:
+                    block = [new_mrna(rna_id, gene, members, gx["type"] == "pseudogene")]
+                    block.extend(exon_like(c, rna_id, f"exon-{stem}-cds{k}-{n}", int(c["start"]), int(c["end"]))
+                                 for n, c in enumerate(sorted(members, key=lambda c: int(c["start"])), 1))
+                block.extend(reparent(members, rna_id))
+                after_gene[gene].extend(block)
+        elif introns and not exons and not cdss:
+            removed.update(id(i) for i in introns)      # the curator would turn them into exons with no RNA to hold them
+            counts["introns_removed"] += len(introns)
+        elif exons and not cdss:
+            removed.update(id(k) for k in kids)
+            rna_id = f"rna-{stem}-tx1"
+            block = [new_mrna(rna_id, gene, exons, gx["type"] == "pseudogene")]
+            block.extend(dict(e, attributes=par_re.sub("Parent=" + rna_id, e["attributes"], count=1)) for e in exons)
+            after_gene[gene].extend(block)
+
+    for rna, cdss in rna_cds.items():                                              # rule 3
         if rna_entry[rna]["type"] != "mRNA":
             continue
-        by_prot = defaultdict(list)
-        for cds in cdss:
-            by_prot[_prot(cds)].append(cds)
-        if len(by_prot) < 2:
-            continue
-        for k, members in enumerate(list(by_prot.values())[1:], 2):
+        groups = by_protein(cdss)
+        for k, members in enumerate(groups[1:], 2):
             rna_id = f"{rna}-p{k}"
-            after[rna].append(new_mrna(rna_id, rna2gene[rna], members))
-            after[rna].extend(reparent(members, rna_id))
-            moved.update(id(c) for c in members)
+            after_rna[rna].append(new_mrna(rna_id, rna2gene[rna], members))
+            after_rna[rna].extend(reparent(members, rna_id))
+            removed.update(id(c) for c in members)
 
-    if not after:
-        return kept, counts
+    if not removed and not after_rna and not after_gene:
+        return list(gff_list), counts
+    # NCBI writes a gene made of several parts as several lines with one ID, and the curator starts the gene
+    # over at each of them, so the new entries go after the last of those lines
+    last_line = {}
+    for n, entry in enumerate(gff_list):
+        if entry["type"] in ("gene", "pseudogene"):
+            last_line[_id(entry)] = n
     ordered = []
-    for entry in kept:
-        if id(entry) in moved:
+    for n, entry in enumerate(gff_list):
+        if id(entry) in removed:
             continue
         ordered.append(entry)
         id_ = _id(entry)
-        if id_ in after and _is_rna(entry):
-            ordered.extend(after.pop(id_))
-    for leftover in after.values():  # cannot happen when every RNA entry has an ID; keep the CDSs anyway
+        if id_ in after_rna and _is_rna(entry):
+            ordered.extend(after_rna.pop(id_))
+        if id_ in after_gene and entry["type"] in ("gene", "pseudogene") and last_line.get(id_) == n:
+            ordered.extend(after_gene.pop(id_))
+    for leftover in list(after_rna.values()) + list(after_gene.values()):  # an RNA or gene with no ID: keep the entries
         ordered.extend(leftover)
     return ordered, counts
 
