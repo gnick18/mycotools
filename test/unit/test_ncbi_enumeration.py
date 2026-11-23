@@ -338,13 +338,14 @@ def test_versions_compare_as_numbers_not_text():
     assert len(updates) == 1 and len(new) == 1
 
 
-def test_two_database_rows_of_one_assembly_collapse_into_one_update():
+def test_of_two_database_rows_of_one_assembly_the_newest_versioned_one_is_the_update():
     """A versioned and an unversioned copy of the same assembly: the newest
-    stands for it, both leave the database, one update is recorded."""
+    versioned row is the one an update replaces, and the unversioned copy,
+    which is curated separately, stays."""
     db = database([("aspnig1", "GCA_000001", "1"), ("aspnig2", "GCA_000001.2", "20200101000000")])
     new, kept, updates, old = redundancy_check(db, listing(["GCA_000001.3"]), "assembly_acc")
     assert len(updates) == 1 and updates[0][0] == "GCA_000001.2" and updates[0][4] == "aspnig2"
-    assert set(kept["ome"]) == set() and len(new) == 1
+    assert set(kept["ome"]) == {"aspnig1"} and len(new) == 1
 
 
 def test_a_database_row_with_no_accession_does_not_stop_the_check():
